@@ -31,7 +31,8 @@ data/raw/
 .vscode/
 .idea/
 *.swp
-.claude/settings.local.json
+.claude/
+CLAUDE.md
 
 # OS
 .DS_Store
