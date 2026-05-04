@@ -26,6 +26,10 @@ pub struct Config {
 
     // Trading behaviour
     pub dry_run: bool,
+    /// Master switch — when false, the bot logs signals but never submits.
+    /// Default: false (observe mode). Sprint 6 wires the execution loop;
+    /// Sprint 9 is the testnet drill that flips this to true.
+    pub execution_enabled: bool,
     pub max_bet_dollars: f64,
     pub bankroll: f64,
     pub min_edge: f64,
@@ -103,6 +107,7 @@ impl Config {
             polymarket_api_passphrase: req("POLYMARKET_API_PASSPHRASE")?,
             polymarket_signature_type: sig_type,
             polymarket_funder_address: funder,
+            execution_enabled:         bool_var("EXECUTION_ENABLED", false)?,
             alchemy_polygon_key:      req("ALCHEMY_POLYGON_KEY")?,
             anthropic_api_key:        get("ANTHROPIC_API_KEY"),
             dry_run:                  bool_var("DRY_RUN", true)?,
@@ -166,6 +171,8 @@ mod tests {
         // Default signature type is EOA, no funder needed
         assert_eq!(cfg.polymarket_signature_type, SignatureType::Eoa);
         assert!(cfg.polymarket_funder_address.is_none());
+        // EXECUTION_ENABLED defaults to false (observe-mode safety)
+        assert!(!cfg.execution_enabled);
         assert_eq!(cfg.alchemy_polygon_key,       "test-alchemy-key");
         assert_eq!(cfg.anthropic_api_key.as_deref(), Some("test-anthropic-key"));
         assert!(cfg.dry_run);
@@ -255,6 +262,15 @@ mod tests {
         let mut env = fixture();
         env.insert("POLYMARKET_SIGNATURE_TYPE".into(), "WAT".into());
         assert!(parse(&env).is_err());
+    }
+
+    #[test]
+    fn execution_enabled_parses_from_env() {
+        let mut env = fixture();
+        env.insert("EXECUTION_ENABLED".into(), "true".into());
+        assert!(parse(&env).unwrap().execution_enabled);
+        env.insert("EXECUTION_ENABLED".into(), "false".into());
+        assert!(!parse(&env).unwrap().execution_enabled);
     }
 
     #[test]

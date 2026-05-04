@@ -16,6 +16,8 @@
 
 use anyhow::{Context, Result};
 
+use std::sync::Arc;
+
 use crate::execution::clob::ClobClient;
 use crate::execution::kelly::kelly_size;
 use crate::execution::orders::{
@@ -25,6 +27,7 @@ use crate::execution::presign::{OrderPool, PoolKey, PopulateParams};
 use crate::features::FeatureState;
 use crate::risk::limits::{RiskConfig, RiskLimits};
 use crate::signals::{Direction, SignalDecision};
+use crate::storage::PositionStore;
 use crate::streams::polymarket::PolyMarket;
 
 /// Side identifier in human-readable form (mirrors PolyMarket Up/Down).
@@ -73,6 +76,10 @@ pub struct ExecContext<'a> {
     pub risk_cfg: &'a RiskConfig,
     pub pool:     &'a OrderPool,
     pub client:   &'a ClobClient,
+    /// Optional position store. When provided, execute_signal records every
+    /// terminal outcome (Submitted/Rejected/Errored) to the JSONL ledger.
+    /// In tests where ledger semantics aren't relevant we pass None.
+    pub positions: Option<&'a Arc<PositionStore>>,
 }
 
 pub async fn execute_signal(
@@ -142,6 +149,12 @@ pub async fn execute_signal(
         Ok(o)  => o,
         Err(e) => {
             tracing::error!(error = %e, "CLOB submit transport error");
+            if let Some(positions) = ctx.positions {
+                let local_id = local_order_id(&signed.order.salt);
+                if let Err(le) = positions.record_fail(&local_id, format!("transport: {e}")) {
+                    tracing::error!(error = %le, "position log: record_fail failed");
+                }
+            }
             return ExecOutcome::Errored { error: e.to_string() };
         }
     };
@@ -152,6 +165,17 @@ pub async fn execute_signal(
             http_status = outcome.http_status,
             "CLOB rejected order"
         );
+        // Record the failure to the position ledger so reconciliation can
+        // see it (and so the wire-format diagnostic is preserved).
+        if let Some(positions) = ctx.positions {
+            // We don't have a Polymarket order_id (rejection means none was
+            // assigned), so synthesise a deterministic local id from the
+            // pre-signed salt — guaranteed unique per attempt.
+            let local_id = local_order_id(&signed.order.salt);
+            if let Err(e) = positions.record_fail(&local_id, &outcome.error_msg) {
+                tracing::error!(error = %e, "position log: record_fail failed");
+            }
+        }
         return ExecOutcome::Rejected {
             reason:      outcome.error_msg,
             http_status: outcome.http_status,
@@ -167,6 +191,24 @@ pub async fn execute_signal(
     if !outcome.dry_run {
         ctx.risk.record_open(bet);
     }
+
+    // Position ledger: record the open. Use Polymarket order_id when it gave
+    // us one, else fall back to a deterministic local id from the salt
+    // (DRY_RUN, or rare success-without-id responses).
+    if let Some(positions) = ctx.positions {
+        let order_id = if outcome.order_id.is_empty() {
+            local_order_id(&signed.order.salt)
+        } else {
+            outcome.order_id.clone()
+        };
+        let market_id = ctx.state.primary_market_id.clone().unwrap_or_default();
+        if let Err(e) = positions.record_open(
+            &order_id, market_id, target.side.as_str(), bet, target.price,
+        ) {
+            tracing::error!(error = %e, "position log: record_open failed");
+        }
+    }
+
     tracing::info!(
         bet,
         price = target.price,
@@ -184,6 +226,15 @@ pub async fn execute_signal(
         dry_run:     outcome.dry_run,
         attempts:    outcome.attempts,
     }
+}
+
+/// Build a deterministic local order id from the pre-signed salt — used when
+/// Polymarket does not return an order_id (DRY_RUN, or 4xx rejections).
+/// Format: "local-<16 hex chars from low-8 bytes of salt>"
+fn local_order_id(salt: &[u8; 32]) -> String {
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&salt[24..]);
+    format!("local-{:016x}", u64::from_be_bytes(buf))
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -566,6 +617,7 @@ mod tests {
             state: &state, markets: &markets,
             risk: &risk, risk_cfg: &cfg,
             pool: &pool, client: &client,
+            positions: None,
         };
 
         let dec = oracle_up_signal(0.45, 0.85);
@@ -605,6 +657,7 @@ mod tests {
             state: &state, markets: &markets,
             risk: &risk, risk_cfg: &cfg,
             pool: &pool, client: &client,
+            positions: None,
         };
         let dec = oracle_down_signal(0.55, 0.90);
         let outcome = execute_signal(&dec, &ctx).await;
@@ -624,7 +677,7 @@ mod tests {
         let client = make_client_dry_run();
         let state = sample_state();
         let markets = vec![sample_market()];
-        let ctx = ExecContext { state: &state, markets: &markets, risk: &risk, risk_cfg: &cfg, pool: &pool, client: &client };
+        let ctx = ExecContext { state: &state, markets: &markets, risk: &risk, risk_cfg: &cfg, pool: &pool, client: &client, positions: None };
 
         let outcome = execute_signal(&SignalDecision::None, &ctx).await;
         assert!(matches!(outcome, ExecOutcome::Skipped { .. }));
@@ -642,7 +695,7 @@ mod tests {
         let client = make_client_dry_run();
         let state = sample_state();
         let markets = vec![sample_market()];
-        let ctx = ExecContext { state: &state, markets: &markets, risk: &risk, risk_cfg: &cfg, pool: &pool, client: &client };
+        let ctx = ExecContext { state: &state, markets: &markets, risk: &risk, risk_cfg: &cfg, pool: &pool, client: &client, positions: None };
 
         // fair_value < market_price → no edge → kelly = 0
         let dec = oracle_up_signal(0.55, 0.45);
@@ -664,7 +717,7 @@ mod tests {
         let client = make_client_dry_run();
         let state = sample_state();
         let markets = vec![sample_market()];
-        let ctx = ExecContext { state: &state, markets: &markets, risk: &risk, risk_cfg: &cfg, pool: &pool, client: &client };
+        let ctx = ExecContext { state: &state, markets: &markets, risk: &risk, risk_cfg: &cfg, pool: &pool, client: &client, positions: None };
 
         let dec = oracle_up_signal(0.45, 0.85);
         let outcome = execute_signal(&dec, &ctx).await;
@@ -689,7 +742,7 @@ mod tests {
         let client = make_client_dry_run();
         let state = sample_state();
         let markets = vec![sample_market()];
-        let ctx = ExecContext { state: &state, markets: &markets, risk: &risk, risk_cfg: &cfg, pool: &pool, client: &client };
+        let ctx = ExecContext { state: &state, markets: &markets, risk: &risk, risk_cfg: &cfg, pool: &pool, client: &client, positions: None };
 
         let dec = oracle_up_signal(0.80, 0.95);
         let outcome = execute_signal(&dec, &ctx).await;
@@ -710,7 +763,7 @@ mod tests {
         let state = sample_state();
         // Empty markets list — primary_market_id won't resolve.
         let markets: Vec<PolyMarket> = vec![];
-        let ctx = ExecContext { state: &state, markets: &markets, risk: &risk, risk_cfg: &cfg, pool: &pool, client: &client };
+        let ctx = ExecContext { state: &state, markets: &markets, risk: &risk, risk_cfg: &cfg, pool: &pool, client: &client, positions: None };
         let dec = oracle_up_signal(0.45, 0.85);
         let outcome = execute_signal(&dec, &ctx).await;
         assert!(matches!(outcome, ExecOutcome::Skipped { .. }));
@@ -731,7 +784,7 @@ mod tests {
         let client = make_client_dry_run();
         let state = sample_state();
         let markets = vec![sample_market()];
-        let ctx = ExecContext { state: &state, markets: &markets, risk: &risk, risk_cfg: &cfg, pool: &pool, client: &client };
+        let ctx = ExecContext { state: &state, markets: &markets, risk: &risk, risk_cfg: &cfg, pool: &pool, client: &client, positions: None };
 
         let dec = oracle_up_signal(0.45, 0.85);
         let _ = execute_signal(&dec, &ctx).await;        // denied
@@ -888,6 +941,7 @@ mod tests {
             state: &state, markets: &markets,
             risk: &risk, risk_cfg: &cfg,
             pool: &pool, client: &client,
+            positions: None,
         };
 
         // Up signal at 45¢ — should hit the YES ladder we just signed.
@@ -941,6 +995,7 @@ mod tests {
             state: &state, markets: &markets,
             risk: &risk, risk_cfg: &cfg,
             pool: &pool, client: &client,
+            positions: None,
         };
 
         let dec = oracle_up_signal(0.45, 0.85);
@@ -956,6 +1011,127 @@ mod tests {
         let _ = mock.await;
     }
 
+    // ── PositionStore wiring (S5.1) ─────────────────────────────────────
+
+    fn temp_positions() -> std::sync::Arc<crate::storage::PositionStore> {
+        let dir = std::env::temp_dir().join(format!(
+            "constantine-exec-{}", uuid::Uuid::new_v4()
+        ));
+        std::sync::Arc::new(crate::storage::PositionStore::open(&dir).unwrap())
+    }
+
+    #[tokio::test]
+    async fn submitted_outcome_records_open_to_position_store() {
+        let pool = OrderPool::new();
+        populate_pool_for_market(&pool, UP_TOKEN_ID);
+        let risk    = RiskLimits::new();
+        let cfg     = RiskConfig::default();
+        let client  = make_client_dry_run();
+        let state   = sample_state();
+        let markets = vec![sample_market()];
+        let positions = temp_positions();
+        let ctx = ExecContext {
+            state: &state, markets: &markets,
+            risk: &risk, risk_cfg: &cfg,
+            pool: &pool, client: &client,
+            positions: Some(&positions),
+        };
+
+        let _ = execute_signal(&oracle_up_signal(0.45, 0.85), &ctx).await;
+
+        // One position recorded
+        assert_eq!(positions.len(), 1);
+        let p = positions.all().into_iter().next().unwrap();
+        assert_eq!(p.status, crate::storage::PositionStatus::Submitted);
+        assert_eq!(p.market_id, "btc-5m-window-1");
+        assert_eq!(p.side, "yes");
+        assert!((p.bet_dollars - 30.0).abs() < 0.01);
+        // DRY_RUN gives no order_id; we synthesise a "local-..." one
+        assert!(p.order_id.starts_with("local-"));
+    }
+
+    #[tokio::test]
+    async fn rejected_outcome_records_fail_to_position_store() {
+        // 4xx response from the CLOB → ExecOutcome::Rejected, position
+        // ledger gets a Fail event (not an Open).
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 8192];
+                let _ = sock.read(&mut buf).await;
+                let body = r#"{"success":false,"errorMsg":"bad sig"}"#;
+                let resp = format!(
+                    "HTTP/1.1 400 BAD\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
+                    body.len(), body,
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let pool = OrderPool::new();
+        populate_pool_for_market(&pool, UP_TOKEN_ID);
+        let mut clob_cfg = crate::execution::clob::ClobConfig::new(TEST_ADDR, sample_creds(), false);
+        clob_cfg.base_url = format!("http://{}", addr);
+        clob_cfg.max_retries = 0;
+        clob_cfg.initial_backoff_ms = 1;
+        let client = crate::execution::clob::ClobClient::new(clob_cfg).unwrap();
+
+        let risk      = RiskLimits::new();
+        let cfg       = RiskConfig::default();
+        let state     = sample_state();
+        let markets   = vec![sample_market()];
+        let positions = temp_positions();
+        let ctx = ExecContext {
+            state: &state, markets: &markets,
+            risk: &risk, risk_cfg: &cfg,
+            pool: &pool, client: &client,
+            positions: Some(&positions),
+        };
+
+        let outcome = execute_signal(&oracle_up_signal(0.45, 0.85), &ctx).await;
+        assert!(matches!(outcome, ExecOutcome::Rejected { .. }));
+
+        // Fail event was recorded — but the position never had an Open,
+        // so nothing in `all()` (record_fail on unknown id is a no-op
+        // semantically; only the JSONL line is written).
+        assert_eq!(positions.len(), 0);
+        let log_content = std::fs::read_to_string(positions.path()).unwrap();
+        assert!(log_content.contains("\"kind\":\"fail\""), "Fail event should be in jsonl");
+    }
+
+    #[tokio::test]
+    async fn skipped_outcomes_do_not_touch_position_store() {
+        // No signal → Skipped → ledger should be empty
+        let pool = OrderPool::new();
+        let risk = RiskLimits::new();
+        let cfg = RiskConfig::default();
+        let client = make_client_dry_run();
+        let state = sample_state();
+        let markets = vec![sample_market()];
+        let positions = temp_positions();
+        let ctx = ExecContext {
+            state: &state, markets: &markets,
+            risk: &risk, risk_cfg: &cfg,
+            pool: &pool, client: &client,
+            positions: Some(&positions),
+        };
+        let _ = execute_signal(&SignalDecision::None, &ctx).await;
+        assert_eq!(positions.len(), 0);
+    }
+
+    #[test]
+    fn local_order_id_is_deterministic_for_same_salt() {
+        let s1 = [0u8; 32];
+        let mut s2 = [0u8; 32];
+        s2[24..].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(local_order_id(&s1), "local-0000000000000000");
+        assert_eq!(local_order_id(&s2), "local-0102030405060708");
+        // Same salt → same id
+        assert_eq!(local_order_id(&s2), local_order_id(&s2));
+    }
+
     #[tokio::test]
     async fn second_call_at_same_price_reports_pool_miss() {
         let pool = OrderPool::new();
@@ -965,7 +1141,7 @@ mod tests {
         let client = make_client_dry_run();
         let state = sample_state();
         let markets = vec![sample_market()];
-        let ctx = ExecContext { state: &state, markets: &markets, risk: &risk, risk_cfg: &cfg, pool: &pool, client: &client };
+        let ctx = ExecContext { state: &state, markets: &markets, risk: &risk, risk_cfg: &cfg, pool: &pool, client: &client, positions: None };
 
         let dec = oracle_up_signal(0.45, 0.85);
         let first = execute_signal(&dec, &ctx).await;
