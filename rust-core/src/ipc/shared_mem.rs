@@ -27,7 +27,7 @@ use tokio::time::{Duration, MissedTickBehavior};
 
 use crate::features::FeatureState;
 use super::protocol::{
-    deserialize_signal, serialize_features, FeatureSnapshot, PythonSignal,
+    deserialize_signal, serialize_features, PythonSignal,
     FEATURES_BYTES, SIGNAL_BYTES,
 };
 

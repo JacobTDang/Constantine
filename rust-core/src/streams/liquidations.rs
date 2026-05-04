@@ -6,7 +6,6 @@ use super::StreamEvent;
 use super::binance::{parse_liquidations, reconnect, OKX_PUBLIC_URL};
 use serde_json::json;
 use tokio::sync::broadcast;
-use tokio::time::Duration;
 
 /// B6 — real-time BTC liquidation orders from OKX.
 pub async fn liq_stream(tx: broadcast::Sender<StreamEvent>) {
@@ -28,6 +27,7 @@ pub async fn liq_stream(tx: broadcast::Sender<StreamEvent>) {
 mod tests {
     use super::*;
     use crate::streams::LiqSide;
+    use tokio::time::Duration;
 
     // Parsing tests are in binance.rs where the parser lives.
     // These tests verify the liq_stream integration layer.

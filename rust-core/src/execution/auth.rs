@@ -103,6 +103,7 @@ pub fn auth_headers_now(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use base64::{engine::general_purpose::URL_SAFE, Engine as _};
 
     // RFC 4231 HMAC-SHA256 test vector #4:

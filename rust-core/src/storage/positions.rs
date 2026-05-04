@@ -18,7 +18,6 @@
 //     independent, so 20 cores can resolve 20 positions in the time it
 //     takes to do 1.
 
-use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -628,10 +627,4 @@ mod tests {
         _assert_send_sync::<PositionStore>();
     }
 
-    // Force HashMap to be referenced so we don't get unused-import warnings on builds
-    // that strip cfg(test) modules differently.
-    #[allow(dead_code)]
-    fn _hashmap_compile_check() {
-        let _: HashMap<String, Position> = HashMap::new();
-    }
 }
