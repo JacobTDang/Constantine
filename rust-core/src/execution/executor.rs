@@ -80,6 +80,11 @@ pub struct ExecContext<'a> {
     /// terminal outcome (Submitted/Rejected/Errored) to the JSONL ledger.
     /// In tests where ledger semantics aren't relevant we pass None.
     pub positions: Option<&'a Arc<PositionStore>>,
+    /// S6: explicit market id for multi-market routing. When set, the
+    /// executor uses this instead of `state.primary_market_id`. Lets the
+    /// runner loop dispatch one signal per market in parallel without
+    /// mutating shared state to "select" a primary.
+    pub target_market_id: Option<&'a str>,
 }
 
 pub async fn execute_signal(
@@ -87,7 +92,7 @@ pub async fn execute_signal(
     ctx:      &ExecContext<'_>,
 ) -> ExecOutcome {
     // 1. Resolve which token + price + p_win we'd buy.
-    let target = match resolve_target(decision, ctx.state, ctx.markets) {
+    let target = match resolve_target(decision, ctx.state, ctx.markets, ctx.target_market_id) {
         Ok(t)  => t,
         Err(r) => {
             tracing::debug!(reason = %r, "execute_signal skipped");
@@ -201,7 +206,10 @@ pub async fn execute_signal(
         } else {
             outcome.order_id.clone()
         };
-        let market_id = ctx.state.primary_market_id.clone().unwrap_or_default();
+        let market_id = ctx.target_market_id
+            .map(|s| s.to_string())
+            .or_else(|| ctx.state.primary_market_id.clone())
+            .unwrap_or_default();
         if let Err(e) = positions.record_open(
             &order_id, market_id, target.side.as_str(), bet, target.price,
         ) {
@@ -247,9 +255,10 @@ struct Target {
 }
 
 fn resolve_target(
-    decision: &SignalDecision,
-    state:    &FeatureState,
-    markets:  &[PolyMarket],
+    decision:         &SignalDecision,
+    state:            &FeatureState,
+    markets:          &[PolyMarket],
+    target_market_id: Option<&str>,
 ) -> Result<Target, String> {
     let oracle = match decision {
         SignalDecision::None              => return Err("no signal".to_string()),
@@ -261,8 +270,11 @@ fn resolve_target(
         SignalDecision::Oracle(s) => s,
     };
 
-    let market_id = state.primary_market_id.as_deref()
-        .ok_or_else(|| "no primary market in state".to_string())?;
+    // Prefer the explicit target (S6 multi-market path); fall back to primary.
+    let market_id = target_market_id
+        .map(|s| s.to_string())
+        .or_else(|| state.primary_market_id.clone())
+        .ok_or_else(|| "no market specified (no target or primary)".to_string())?;
     let market = markets.iter().find(|m| m.id == market_id)
         .ok_or_else(|| format!("market {market_id} not in market list"))?;
 
@@ -553,7 +565,7 @@ mod tests {
         let dec = oracle_up_signal(0.45, 0.85);
         let st  = sample_state();
         let mk  = vec![sample_market()];
-        let t = resolve_target(&dec, &st, &mk).unwrap();
+        let t = resolve_target(&dec, &st, &mk, None).unwrap();
         assert_eq!(t.token_id, UP_TOKEN_ID);
         assert_eq!(t.side, SideLabel::Yes);
         assert!((t.price - 0.45).abs() < 1e-9);
@@ -563,7 +575,7 @@ mod tests {
     #[test]
     fn resolve_target_picks_down_token_for_down_signal() {
         let dec = oracle_down_signal(0.50, 0.80);
-        let t = resolve_target(&dec, &sample_state(), &[sample_market()]).unwrap();
+        let t = resolve_target(&dec, &sample_state(), &[sample_market()], None).unwrap();
         assert_eq!(t.token_id, DOWN_TOKEN_ID);
         assert_eq!(t.side, SideLabel::No);
     }
@@ -573,14 +585,14 @@ mod tests {
         let mut st = sample_state();
         st.primary_market_id = None;
         let dec = oracle_up_signal(0.45, 0.85);
-        assert!(resolve_target(&dec, &st, &[sample_market()]).is_err());
+        assert!(resolve_target(&dec, &st, &[sample_market()], None).is_err());
     }
 
     #[test]
     fn resolve_target_errors_when_market_not_in_list() {
         let dec = oracle_up_signal(0.45, 0.85);
         // Empty markets list → market_id won't match
-        assert!(resolve_target(&dec, &sample_state(), &[]).is_err());
+        assert!(resolve_target(&dec, &sample_state(), &[], None).is_err());
     }
 
     #[test]
@@ -591,12 +603,12 @@ mod tests {
             gross_total: 0.80, gross_profit: 0.20,
             net_profit: 0.18, total_fees: 0.014,
         });
-        assert!(resolve_target(&dec, &sample_state(), &[sample_market()]).is_err());
+        assert!(resolve_target(&dec, &sample_state(), &[sample_market()], None).is_err());
     }
 
     #[test]
     fn resolve_target_errors_for_no_signal() {
-        assert!(resolve_target(&SignalDecision::None, &sample_state(), &[sample_market()]).is_err());
+        assert!(resolve_target(&SignalDecision::None, &sample_state(), &[sample_market()], None).is_err());
     }
 
     // ── execute_signal happy path ────────────────────────────────────────
@@ -617,7 +629,7 @@ mod tests {
             state: &state, markets: &markets,
             risk: &risk, risk_cfg: &cfg,
             pool: &pool, client: &client,
-            positions: None,
+            positions: None, target_market_id: None,
         };
 
         let dec = oracle_up_signal(0.45, 0.85);
@@ -657,7 +669,7 @@ mod tests {
             state: &state, markets: &markets,
             risk: &risk, risk_cfg: &cfg,
             pool: &pool, client: &client,
-            positions: None,
+            positions: None, target_market_id: None,
         };
         let dec = oracle_down_signal(0.55, 0.90);
         let outcome = execute_signal(&dec, &ctx).await;
@@ -677,7 +689,7 @@ mod tests {
         let client = make_client_dry_run();
         let state = sample_state();
         let markets = vec![sample_market()];
-        let ctx = ExecContext { state: &state, markets: &markets, risk: &risk, risk_cfg: &cfg, pool: &pool, client: &client, positions: None };
+        let ctx = ExecContext { state: &state, markets: &markets, risk: &risk, risk_cfg: &cfg, pool: &pool, client: &client, positions: None, target_market_id: None };
 
         let outcome = execute_signal(&SignalDecision::None, &ctx).await;
         assert!(matches!(outcome, ExecOutcome::Skipped { .. }));
@@ -695,7 +707,7 @@ mod tests {
         let client = make_client_dry_run();
         let state = sample_state();
         let markets = vec![sample_market()];
-        let ctx = ExecContext { state: &state, markets: &markets, risk: &risk, risk_cfg: &cfg, pool: &pool, client: &client, positions: None };
+        let ctx = ExecContext { state: &state, markets: &markets, risk: &risk, risk_cfg: &cfg, pool: &pool, client: &client, positions: None, target_market_id: None };
 
         // fair_value < market_price → no edge → kelly = 0
         let dec = oracle_up_signal(0.55, 0.45);
@@ -717,7 +729,7 @@ mod tests {
         let client = make_client_dry_run();
         let state = sample_state();
         let markets = vec![sample_market()];
-        let ctx = ExecContext { state: &state, markets: &markets, risk: &risk, risk_cfg: &cfg, pool: &pool, client: &client, positions: None };
+        let ctx = ExecContext { state: &state, markets: &markets, risk: &risk, risk_cfg: &cfg, pool: &pool, client: &client, positions: None, target_market_id: None };
 
         let dec = oracle_up_signal(0.45, 0.85);
         let outcome = execute_signal(&dec, &ctx).await;
@@ -742,7 +754,7 @@ mod tests {
         let client = make_client_dry_run();
         let state = sample_state();
         let markets = vec![sample_market()];
-        let ctx = ExecContext { state: &state, markets: &markets, risk: &risk, risk_cfg: &cfg, pool: &pool, client: &client, positions: None };
+        let ctx = ExecContext { state: &state, markets: &markets, risk: &risk, risk_cfg: &cfg, pool: &pool, client: &client, positions: None, target_market_id: None };
 
         let dec = oracle_up_signal(0.80, 0.95);
         let outcome = execute_signal(&dec, &ctx).await;
@@ -763,7 +775,7 @@ mod tests {
         let state = sample_state();
         // Empty markets list — primary_market_id won't resolve.
         let markets: Vec<PolyMarket> = vec![];
-        let ctx = ExecContext { state: &state, markets: &markets, risk: &risk, risk_cfg: &cfg, pool: &pool, client: &client, positions: None };
+        let ctx = ExecContext { state: &state, markets: &markets, risk: &risk, risk_cfg: &cfg, pool: &pool, client: &client, positions: None, target_market_id: None };
         let dec = oracle_up_signal(0.45, 0.85);
         let outcome = execute_signal(&dec, &ctx).await;
         assert!(matches!(outcome, ExecOutcome::Skipped { .. }));
@@ -784,7 +796,7 @@ mod tests {
         let client = make_client_dry_run();
         let state = sample_state();
         let markets = vec![sample_market()];
-        let ctx = ExecContext { state: &state, markets: &markets, risk: &risk, risk_cfg: &cfg, pool: &pool, client: &client, positions: None };
+        let ctx = ExecContext { state: &state, markets: &markets, risk: &risk, risk_cfg: &cfg, pool: &pool, client: &client, positions: None, target_market_id: None };
 
         let dec = oracle_up_signal(0.45, 0.85);
         let _ = execute_signal(&dec, &ctx).await;        // denied
@@ -941,7 +953,7 @@ mod tests {
             state: &state, markets: &markets,
             risk: &risk, risk_cfg: &cfg,
             pool: &pool, client: &client,
-            positions: None,
+            positions: None, target_market_id: None,
         };
 
         // Up signal at 45¢ — should hit the YES ladder we just signed.
@@ -995,7 +1007,7 @@ mod tests {
             state: &state, markets: &markets,
             risk: &risk, risk_cfg: &cfg,
             pool: &pool, client: &client,
-            positions: None,
+            positions: None, target_market_id: None,
         };
 
         let dec = oracle_up_signal(0.45, 0.85);
@@ -1034,7 +1046,7 @@ mod tests {
             state: &state, markets: &markets,
             risk: &risk, risk_cfg: &cfg,
             pool: &pool, client: &client,
-            positions: Some(&positions),
+            positions: Some(&positions), target_market_id: None,
         };
 
         let _ = execute_signal(&oracle_up_signal(0.45, 0.85), &ctx).await;
@@ -1087,7 +1099,7 @@ mod tests {
             state: &state, markets: &markets,
             risk: &risk, risk_cfg: &cfg,
             pool: &pool, client: &client,
-            positions: Some(&positions),
+            positions: Some(&positions), target_market_id: None,
         };
 
         let outcome = execute_signal(&oracle_up_signal(0.45, 0.85), &ctx).await;
@@ -1115,10 +1127,53 @@ mod tests {
             state: &state, markets: &markets,
             risk: &risk, risk_cfg: &cfg,
             pool: &pool, client: &client,
-            positions: Some(&positions),
+            positions: Some(&positions), target_market_id: None,
         };
         let _ = execute_signal(&SignalDecision::None, &ctx).await;
         assert_eq!(positions.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn target_market_id_overrides_primary_for_routing() {
+        // primary_market_id = "btc-5m-window-1", but we set target_market_id
+        // to point at a different market in the list. Executor must use the
+        // target's token_id, not the primary's.
+        let mut state = sample_state();
+        state.primary_market_id = Some("btc-5m-window-1".to_string());
+
+        // Add a SECOND market to the markets list with a different up_token_id
+        let other = PolyMarket {
+            id:             "btc-15m-window-A".to_string(),
+            question:       "alt".into(),
+            up_token_id:    "9999999999".into(),
+            down_token_id:  "8888888888".into(),
+            close_time_ms:  2_000_000_000_000,
+            duration_min:   15,
+            liquidity_usd:  1_000.0,
+        };
+        let markets = vec![sample_market(), other.clone()];
+
+        // Pre-sign for the OTHER market's up_token, not the primary's
+        let pool = OrderPool::new();
+        populate_pool_for_market(&pool, &other.up_token_id);
+
+        let risk = RiskLimits::new();
+        let cfg  = RiskConfig::default();
+        let client = make_client_dry_run();
+        let other_id = other.id.clone();
+        let ctx = ExecContext {
+            state: &state, markets: &markets,
+            risk: &risk, risk_cfg: &cfg,
+            pool: &pool, client: &client,
+            positions: None,
+            target_market_id: Some(other_id.as_str()),
+        };
+
+        let dec = oracle_up_signal(0.45, 0.85);
+        let outcome = execute_signal(&dec, &ctx).await;
+        // Submitted because the pool is populated for the OTHER market
+        assert!(matches!(outcome, ExecOutcome::Submitted { .. }),
+            "target_market_id should route to other market — got {outcome:?}");
     }
 
     #[test]
@@ -1141,7 +1196,7 @@ mod tests {
         let client = make_client_dry_run();
         let state = sample_state();
         let markets = vec![sample_market()];
-        let ctx = ExecContext { state: &state, markets: &markets, risk: &risk, risk_cfg: &cfg, pool: &pool, client: &client, positions: None };
+        let ctx = ExecContext { state: &state, markets: &markets, risk: &risk, risk_cfg: &cfg, pool: &pool, client: &client, positions: None, target_market_id: None };
 
         let dec = oracle_up_signal(0.45, 0.85);
         let first = execute_signal(&dec, &ctx).await;

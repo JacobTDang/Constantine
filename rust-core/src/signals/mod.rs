@@ -3,11 +3,14 @@ pub mod oracle_arb;
 pub mod regime;
 
 use std::sync::Arc;
+
+use rayon::prelude::*;
 use tokio::sync::RwLock;
 use tokio::time::{Duration, MissedTickBehavior};
 
 use crate::features::FeatureState;
 use crate::storage::{SignalLog, SignalRow};
+use crate::streams::polymarket::PolyMarket;
 use intramarket::{check_intramarket_arb, IntramarketArbSignal};
 use oracle_arb::{check_oracle_arb, OracleArbSignal};
 use regime::{classify_regime, Regime};
@@ -138,6 +141,102 @@ pub fn evaluate_signals(state: &FeatureState, cfg: &SignalConfig) -> SignalDecis
 /// future ML signal layer (I3) — already exposed so callers can log it.
 pub fn current_regime(state: &FeatureState) -> Regime {
     classify_regime(state.vol_z_score, state.vol_ratio, state.autocorr_lag1)
+}
+
+// ── S6: per-market signal evaluation ────────────────────────────────────────
+
+/// Stateless signal evaluation for a SPECIFIC market, independent of
+/// `state.primary_market_id`. Looks up the per-market book in
+/// `state.asset_books` and applies all gates.
+///
+/// `now_ms` is passed in so tests can drive deterministic timing without
+/// mocking the system clock.
+pub fn evaluate_signals_for_market(
+    market: &PolyMarket,
+    state:  &FeatureState,
+    cfg:    &SignalConfig,
+    now_ms: u64,
+) -> SignalDecision {
+    // Window must be open with enough time left to fill.
+    let time_to_close_secs = market.time_to_close_secs(now_ms);
+    if time_to_close_secs < cfg.min_time_remaining_secs {
+        return SignalDecision::None;
+    }
+
+    // Per-market books — both sides required.
+    let yes_book = match state.asset_books.get(&market.up_token_id) {
+        Some(b) => b,
+        None    => return SignalDecision::None,
+    };
+    let no_book  = match state.asset_books.get(&market.down_token_id) {
+        Some(b) => b,
+        None    => return SignalDecision::None,
+    };
+
+    let yes_ask = yes_book.best_ask;
+    let no_ask  = no_book.best_ask;
+    let spread  = (yes_book.best_ask - yes_book.best_bid).max(0.0);
+
+    // Dollar liquidity at the touch — sum of bid/ask sides.
+    let yes_liq_usd =
+        yes_book.best_bid_size * yes_book.best_bid + yes_book.best_ask_size * yes_book.best_ask;
+    let no_liq_usd  =
+        no_book.best_bid_size  * no_book.best_bid  + no_book.best_ask_size  * no_book.best_ask;
+
+    // Sanity gates
+    if spread > cfg.max_spread {
+        return SignalDecision::None;
+    }
+    if yes_liq_usd < cfg.min_liquidity_usd || no_liq_usd < cfg.min_liquidity_usd {
+        return SignalDecision::None;
+    }
+
+    // Window age — we want a stable strike before firing.
+    let (capture_ms, strike) = match state.window_strikes.get(&market.id) {
+        Some(&(c, s)) => (c, s),
+        None          => (0u64, 0.0),  // no strike yet → oracle path will skip
+    };
+    if capture_ms > 0 {
+        let window_age = (now_ms.saturating_sub(capture_ms)) as f64 / 1000.0;
+        if window_age < cfg.min_window_age_secs {
+            return SignalDecision::None;
+        }
+    }
+
+    // Priority 1: Intramarket arb — risk-free, fires regardless of regime.
+    if let Some(sig) = check_intramarket_arb(
+        yes_ask, no_ask, cfg.fee_rate, cfg.intramarket_min_profit,
+    ) {
+        return SignalDecision::Intramarket(sig);
+    }
+
+    // Priority 2: Oracle arb — needs a captured strike.
+    if strike > 0.0 && state.spot_price > 0.0 {
+        let time_remaining_min = time_to_close_secs / 60.0;
+        if let Some(sig) = check_oracle_arb(
+            state.spot_price, strike, state.vol_5m, time_remaining_min,
+            yes_ask, no_ask, cfg.oracle_arb_threshold,
+        ) {
+            return SignalDecision::Oracle(sig);
+        }
+    }
+
+    SignalDecision::None
+}
+
+/// Evaluate every active market in parallel via rayon. Returns one
+/// (market_id, SignalDecision) per market — closed markets are filtered out.
+pub fn evaluate_all_markets(
+    state:   &FeatureState,
+    markets: &[PolyMarket],
+    cfg:     &SignalConfig,
+    now_ms:  u64,
+) -> Vec<(String, SignalDecision)> {
+    markets
+        .par_iter()
+        .filter(|m| m.close_time_ms > now_ms)
+        .map(|m| (m.id.clone(), evaluate_signals_for_market(m, state, cfg, now_ms)))
+        .collect()
 }
 
 /// Async signal loop: evaluates every 500ms, logs whenever a signal fires.
@@ -482,6 +581,145 @@ mod tests {
     }
 
     // ── Performance ───────────────────────────────────────────────────────
+
+    // ── S6: per-market evaluator ──────────────────────────────────────────
+
+    fn sample_market_for(id: &str, close_ms: u64) -> PolyMarket {
+        PolyMarket {
+            id: id.into(),
+            question: "Bitcoin Up or Down?".into(),
+            up_token_id:   format!("up-{id}"),
+            down_token_id: format!("down-{id}"),
+            close_time_ms: close_ms,
+            duration_min:  5,
+            liquidity_usd: 1_000.0,
+        }
+    }
+
+    fn book(bid: f64, ask: f64, sz: f64) -> crate::features::BookState {
+        crate::features::BookState {
+            best_bid: bid,
+            best_ask: ask,
+            best_bid_size: sz,
+            best_ask_size: sz,
+            last_trade_price: (bid + ask) / 2.0,
+            timestamp_ms: 0,
+        }
+    }
+
+    #[test]
+    fn per_market_eval_returns_none_without_books() {
+        let s = FeatureState::default();
+        let m = sample_market_for("m", 2_000_000_000_000);
+        let d = evaluate_signals_for_market(&m, &s, &SignalConfig::default(), 1_000_000_000_000);
+        assert_eq!(d, SignalDecision::None);
+    }
+
+    #[test]
+    fn per_market_eval_uses_per_market_book() {
+        let mut s = FeatureState::default();
+        s.spot_price = 80_300.0;
+        s.window_strikes.insert("m".into(), (0, 80_000.0));   // captured strike
+        let now_ms = 1_000_000_000_000u64;
+        let m = sample_market_for("m", now_ms + 60_000);
+        // Books — yes underpriced (oracle should fire)
+        s.asset_books.insert(m.up_token_id.clone(),   book(0.65, 0.70, 1000.0));
+        s.asset_books.insert(m.down_token_id.clone(), book(0.30, 0.35, 1000.0));
+        let mut cfg = SignalConfig::default();
+        cfg.min_window_age_secs = 0.0;  // window is fresh in this test
+        let d = evaluate_signals_for_market(&m, &s, &cfg, now_ms);
+        match d {
+            SignalDecision::Oracle(sig) => assert_eq!(sig.direction, Direction::Up),
+            other => panic!("expected Oracle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn per_market_eval_filters_thin_books() {
+        let mut s = FeatureState::default();
+        s.spot_price = 80_300.0;
+        s.window_strikes.insert("m".into(), (0, 80_000.0));
+        let now_ms = 1_000_000_000_000u64;
+        let m = sample_market_for("m", now_ms + 60_000);
+        // Tiny size — yes_liq_usd < 100
+        s.asset_books.insert(m.up_token_id.clone(),   book(0.65, 0.70, 1.0));
+        s.asset_books.insert(m.down_token_id.clone(), book(0.30, 0.35, 1.0));
+        let cfg = SignalConfig::default();
+        assert_eq!(
+            evaluate_signals_for_market(&m, &s, &cfg, now_ms),
+            SignalDecision::None,
+        );
+    }
+
+    #[test]
+    fn per_market_eval_filters_closed_market() {
+        let mut s = FeatureState::default();
+        s.spot_price = 80_300.0;
+        let m = sample_market_for("m", 1_000_000_000_000);
+        let now_ms = m.close_time_ms + 10_000;   // already past close
+        s.asset_books.insert(m.up_token_id.clone(),   book(0.65, 0.70, 1000.0));
+        s.asset_books.insert(m.down_token_id.clone(), book(0.30, 0.35, 1000.0));
+        assert_eq!(
+            evaluate_signals_for_market(&m, &s, &SignalConfig::default(), now_ms),
+            SignalDecision::None,
+        );
+    }
+
+    #[test]
+    fn per_market_eval_intramarket_priority() {
+        let mut s = FeatureState::default();
+        s.spot_price = 80_300.0;
+        s.window_strikes.insert("m".into(), (0, 80_000.0));
+        let now_ms = 1_000_000_000_000u64;
+        let m = sample_market_for("m", now_ms + 60_000);
+        // Both sides cheap → intramarket arb
+        s.asset_books.insert(m.up_token_id.clone(),   book(0.40, 0.42, 1000.0));
+        s.asset_books.insert(m.down_token_id.clone(), book(0.40, 0.42, 1000.0));
+        let mut cfg = SignalConfig::default();
+        cfg.min_window_age_secs = 0.0;
+        match evaluate_signals_for_market(&m, &s, &cfg, now_ms) {
+            SignalDecision::Intramarket(_) => {}
+            other => panic!("expected Intramarket, got {other:?}"),
+        }
+    }
+
+    // ── evaluate_all_markets (parallel) ───────────────────────────────────
+
+    #[test]
+    fn evaluate_all_markets_runs_across_markets() {
+        let mut s = FeatureState::default();
+        s.spot_price = 80_300.0;
+        let now_ms = 1_000_000_000_000u64;
+
+        // 3 markets — m1 has oracle setup, m2 thin, m3 closed
+        let m1 = sample_market_for("m1", now_ms + 60_000);
+        let m2 = sample_market_for("m2", now_ms + 60_000);
+        let m3 = sample_market_for("m3", now_ms - 1_000);   // already closed
+        s.window_strikes.insert("m1".into(), (0, 80_000.0));
+        s.window_strikes.insert("m2".into(), (0, 80_000.0));
+        s.asset_books.insert(m1.up_token_id.clone(),   book(0.65, 0.70, 1000.0));
+        s.asset_books.insert(m1.down_token_id.clone(), book(0.30, 0.35, 1000.0));
+        s.asset_books.insert(m2.up_token_id.clone(),   book(0.65, 0.70, 1.0));     // thin
+        s.asset_books.insert(m2.down_token_id.clone(), book(0.30, 0.35, 1.0));
+
+        let mut cfg = SignalConfig::default();
+        cfg.min_window_age_secs = 0.0;
+
+        let results = evaluate_all_markets(&s, &[m1.clone(), m2.clone(), m3.clone()], &cfg, now_ms);
+        // m3 filtered (closed) — only m1 and m2 returned
+        assert_eq!(results.len(), 2);
+        let m1_dec = results.iter().find(|(id, _)| id == "m1").map(|(_, d)| d.clone());
+        let m2_dec = results.iter().find(|(id, _)| id == "m2").map(|(_, d)| d.clone());
+        assert!(matches!(m1_dec, Some(SignalDecision::Oracle(_))));
+        assert_eq!(m2_dec, Some(SignalDecision::None));   // thin → None
+    }
+
+    #[test]
+    fn evaluate_all_markets_handles_empty_list() {
+        let s = FeatureState::default();
+        let r = evaluate_all_markets(&s, &[], &SignalConfig::default(), 1_000_000_000_000);
+        assert!(r.is_empty());
+    }
 
     #[test]
     fn perf_evaluate_under_5us() {

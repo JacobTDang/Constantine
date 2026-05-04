@@ -94,6 +94,9 @@ async fn main() -> anyhow::Result<()> {
     // (which fills it) and the executor (which drains it).
     let order_pool = Arc::new(execution::presign::OrderPool::new());
 
+    // S5/S6 — risk limits + execution runner shared across spawns.
+    let risk_limits = Arc::new(risk::limits::RiskLimits::new());
+
     // J11: Window-open hook — populates the order pool the moment a new
     // BTC window's strike is captured. Spawning is gated on full config
     // since pre-signing requires a private key + sig type.
@@ -114,6 +117,70 @@ async fn main() -> anyhow::Result<()> {
             watcher_cfg,
         ));
         tracing::info!("window_watcher spawned");
+    }
+
+    // S6.4: Execution runner — every 500ms, evaluate every active market in
+    // parallel (rayon) and dispatch a tokio task per fired signal. Per-market
+    // cooldown prevents stacking trades on the same window.
+    if let Some(c) = &exec_cfg {
+        let creds = execution::auth::ApiCreds {
+            api_key:        c.polymarket_api_key.clone(),
+            api_secret:     c.polymarket_api_secret.clone(),
+            api_passphrase: c.polymarket_api_passphrase.clone(),
+        };
+        let address = c.polymarket_funder_address.clone()
+            .unwrap_or_else(|| {
+                // EOA path: derive from private key
+                match execution::orders::private_key_to_address(&c.polymarket_private_key) {
+                    Ok(a) => execution::orders::address_to_hex(&a),
+                    Err(e) => {
+                        tracing::error!(error = %e, "couldn't derive address — using zero");
+                        "0x0000000000000000000000000000000000000000".to_string()
+                    }
+                }
+            });
+        let mut clob_cfg = execution::clob::ClobConfig::new(address, creds, c.dry_run);
+        clob_cfg.order_type = execution::clob::OrderType::Fak;
+        match execution::clob::ClobClient::new(clob_cfg) {
+            Ok(client) => {
+                let client = Arc::new(client);
+                let risk_cfg = risk::limits::RiskConfig {
+                    bankroll:                  c.bankroll,
+                    max_bet_dollars:           c.max_bet_dollars,
+                    kelly_fraction:            c.kelly_fraction,
+                    min_edge:                  c.min_edge,
+                    daily_loss_limit_dollars:  c.daily_loss_limit_dollars,
+                    weekly_loss_limit_dollars: c.weekly_loss_limit_dollars,
+                    max_open_exposure_dollars: c.max_open_exposure_dollars,
+                    max_daily_trades:          100,
+                };
+                let sig_cfg = signals::SignalConfig {
+                    fee_rate:                0.018,
+                    intramarket_min_profit:  0.005,
+                    oracle_arb_threshold:    c.oracle_arb_threshold,
+                    min_time_remaining_secs: 5.0,
+                    min_liquidity_usd:       c.min_liquidity,
+                    max_spread:              0.10,
+                    min_window_age_secs:     15.0,
+                };
+                let runner_cfg = execution::runner::RunnerConfig::default();
+                tasks.spawn(execution::runner::execution_runner_loop(
+                    state.clone(),
+                    markets.clone(),
+                    order_pool.clone(),
+                    risk_limits.clone(),
+                    risk_cfg,
+                    sig_cfg,
+                    client,
+                    positions.clone(),
+                    runner_cfg,
+                ));
+                tracing::info!(dry_run = c.dry_run, "execution_runner spawned");
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "ClobClient build failed — runner NOT spawned");
+            }
+        }
     }
 
     // Signal evaluation loop (E5) — every 500ms, picks intramarket > oracle
