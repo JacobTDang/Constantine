@@ -34,7 +34,10 @@ use crate::signals::{evaluate_all_markets, SignalConfig, SignalDecision};
 use crate::storage::PositionStore;
 use crate::streams::polymarket::PolyMarket;
 
-const TICK_MS: u64 = 500;
+// G6: 200ms — was 500ms. Real edge windows in BTC are < 100ms; 500ms
+// meant we routinely acted on stale state. CPU is cheap (rayon already
+// fans across 20 cores during eval) so the higher cadence is free.
+const TICK_MS: u64 = 200;
 
 /// Settings the runner reads each tick. Built from main.rs::Config.
 #[derive(Debug, Clone)]

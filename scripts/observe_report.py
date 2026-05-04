@@ -170,6 +170,42 @@ def main() -> int:
                 print(f"  calibration gap:      {gap:.3f}    ({'GOOD' if gap < 0.05 else 'POOR' if gap > 0.10 else 'OK'})")
             print()
 
+            # G10 — Baseline comparison: did our strategy actually beat
+            # naive baselines? Just printing "win rate 56%" is meaningless
+            # without a reference point.
+            print("Baseline comparison (oracle signals only):")
+            if len(oracle) > 0:
+                # Baseline 1: always bet UP (regardless of model)
+                always_up_correct  = oracle["outcome_up"].mean()
+                # Baseline 2: always bet DOWN
+                always_down_correct = (~oracle["outcome_up"]).mean()
+                # Baseline 3: random with 50/50 split (analytic, not simulated)
+                random_correct = 0.50
+                # Baseline 4: bet whichever side the MARKET favours (the wisdom
+                # of the crowd / passive index strategy)
+                market_choice_correct = oracle.apply(
+                    lambda r: (r["outcome_up"] if r["yes_ask"] < r["no_ask"]
+                               else not r["outcome_up"]),
+                    axis=1,
+                ).mean()
+
+                strategy_correct = oracle["correct"].mean()
+                print(f"  our strategy:        {strategy_correct*100:5.1f}%  (n={len(oracle)})")
+                print(f"  always bet UP:       {always_up_correct*100:5.1f}%")
+                print(f"  always bet DOWN:     {always_down_correct*100:5.1f}%")
+                print(f"  random (50/50):      {random_correct*100:5.1f}%")
+                print(f"  follow the market:   {market_choice_correct*100:5.1f}%")
+                edge_vs_random = strategy_correct - random_correct
+                edge_vs_market = strategy_correct - market_choice_correct
+                print(f"  edge vs random:      {edge_vs_random*100:+5.1f}pp  "
+                      f"({'POSITIVE' if edge_vs_random > 0.02 else 'NEUTRAL' if edge_vs_random > -0.02 else 'NEGATIVE'})")
+                print(f"  edge vs market:      {edge_vs_market*100:+5.1f}pp  "
+                      f"({'POSITIVE' if edge_vs_market > 0.02 else 'NEUTRAL' if edge_vs_market > -0.02 else 'NEGATIVE'})")
+                # The "edge vs market" line is the most important one — if
+                # the bot loses to "follow the crowd" we have anti-edge
+                # and should NOT trade.
+            print()
+
         # Daily breakdown
         sigs_with_day = sigs.copy()
         sigs_with_day["day"] = pd.to_datetime(sigs_with_day["fired_at_ms"], unit="ms", utc=True).dt.date

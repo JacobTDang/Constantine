@@ -106,6 +106,37 @@ async fn main() -> anyhow::Result<()> {
         state.clone(), risk_limits.clone(), positions.clone(), 30,
     ));
 
+    // G2 — USDC allowance watchdog. Polls the CTF Exchange's allowance
+    // every 5 minutes via Polygon RPC; trips kill switch when balance
+    // falls below threshold. Only spawned when execution is enabled AND
+    // we have an Alchemy key (the Config gates this).
+    if let Some(c) = &exec_cfg {
+        if !c.alchemy_polygon_key.is_empty() {
+            // Derive the owner address (funder for proxy types, EOA otherwise)
+            let owner = c.polymarket_funder_address.clone()
+                .or_else(|| {
+                    execution::orders::private_key_to_address(&c.polymarket_private_key)
+                        .ok()
+                        .map(|a| execution::orders::address_to_hex(&a))
+                });
+            if let Some(owner) = owner {
+                let rpc_url = format!(
+                    "https://polygon-mainnet.g.alchemy.com/v2/{}",
+                    c.alchemy_polygon_key
+                );
+                let watchdog_cfg = risk::allowance::AllowanceWatchdogConfig::for_polygon_eoa(
+                    rpc_url, owner,
+                );
+                tasks.spawn(risk::allowance::allowance_watchdog_loop(
+                    watchdog_cfg, risk_limits.clone(),
+                ));
+                tracing::info!("allowance watchdog spawned");
+            } else {
+                tracing::warn!("allowance watchdog NOT spawned — couldn't derive owner address");
+            }
+        }
+    }
+
     // J11: Window-open hook — populates the order pool the moment a new
     // BTC window's strike is captured. Spawning is gated on full config
     // since pre-signing requires a private key + sig type.

@@ -27,7 +27,10 @@ use super::StreamEvent;
 const GAMMA_URL: &str =
     "https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=100&order=startDate&ascending=false";
 
-const POLL_INTERVAL_SECS: u64 = 300; // 5 minutes
+// G3: 30s — was 300s. For 5-MINUTE markets, 5-minute discovery cadence
+// meant we'd miss the first 60-90 seconds of every market's life,
+// including the high-edge fresh-window window.
+const POLL_INTERVAL_SECS: u64 = 30;
 const REQUEST_TIMEOUT_SECS: u64 = 10;
 
 // ── Public type ──────────────────────────────────────────────────────────────
