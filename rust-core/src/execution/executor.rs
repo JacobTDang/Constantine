@@ -20,10 +20,15 @@ use std::sync::Arc;
 
 use crate::execution::clob::ClobClient;
 use crate::execution::kelly::kelly_size;
+#[cfg(test)]
+use crate::execution::orders::Side;
 use crate::execution::orders::{
-    private_key_to_address, u256_from_dec, Domain, SignatureType, Side, SignedOrder,
+    address_to_hex, hex_to_address, private_key_to_address,
+    u256_from_dec, Domain, SignatureType, SignedOrder,
 };
+#[cfg(test)]
 use crate::execution::presign::{OrderPool, PoolKey, PopulateParams};
+use crate::execution::presign::{sign_buy_now, BuyOrderInputs};
 use crate::features::FeatureState;
 use crate::risk::limits::{RiskConfig, RiskLimits};
 use crate::signals::intramarket::IntramarketArbSignal;
@@ -68,6 +73,41 @@ pub enum ExecOutcome {
     Errored { error: String },
 }
 
+/// G5: Signing parameters for the Kelly-aware sign-on-demand path.
+///
+/// Built once by main.rs from Config; the runner clones it per dispatched
+/// task. ECDSA signing is ~150µs in release mode, so doing it on the hot
+/// path is fine — well below the 100-300ms HTTP round-trip budget.
+#[derive(Debug, Clone)]
+pub struct SigningParams {
+    pub domain:          Domain,
+    pub private_key_hex: String,
+    pub signature_type:  SignatureType,
+    /// Required when signature_type is PolyProxy or PolyGnosis (= the
+    /// proxy/safe address that holds USDC). Unused for EOA.
+    pub funder_address:  Option<String>,
+    /// Per-wallet cancellation nonce. Default 0.
+    pub nonce:           u64,
+    /// Set to 0 — Polymarket computes fees server-side.
+    pub fee_rate_bps:    u64,
+    /// 0x0 = anyone-can-take. The taker field on the order.
+    pub taker:           [u8; 20],
+}
+
+impl Default for SigningParams {
+    fn default() -> Self {
+        Self {
+            domain:          Domain::polymarket_polygon(),
+            private_key_hex: String::new(),
+            signature_type:  SignatureType::Eoa,
+            funder_address:  None,
+            nonce:           0,
+            fee_rate_bps:    0,
+            taker:           [0u8; 20],
+        }
+    }
+}
+
 /// Read-only references the executor needs each call. Keeping this as a
 /// borrow-bag avoids forcing the caller to clone Arc handles per tick.
 pub struct ExecContext<'a> {
@@ -75,7 +115,10 @@ pub struct ExecContext<'a> {
     pub markets:  &'a [PolyMarket],
     pub risk:     &'a RiskLimits,
     pub risk_cfg: &'a RiskConfig,
-    pub pool:     &'a OrderPool,
+    /// G5: signing params (replaces the deprecated pool field). The
+    /// executor always re-signs at exact Kelly bet — no more pre-signed
+    /// pool that locks orders at max_bet.
+    pub signing:  &'a SigningParams,
     pub client:   &'a ClobClient,
     /// Optional position store. When provided, execute_signal records every
     /// terminal outcome (Submitted/Rejected/Errored) to the JSONL ledger.
@@ -131,28 +174,23 @@ pub async fn execute_signal(
         return ExecOutcome::Skipped { reason };
     }
 
-    // 4. Pre-signed order lookup. Must come AFTER risk so a denied trade
-    //    doesn't burn a pre-signed slot.
-    let asset_id = match u256_from_dec(&target.token_id) {
-        Ok(id) => id,
-        Err(e) => {
-            return ExecOutcome::Skipped {
-                reason: format!("token id parse failed: {e}"),
-            };
-        }
+    // 4. Sign-on-demand at exact Kelly bet (G5). Replaces the old pool path
+    //    that always signed at max_bet — Kelly was effectively bypassed.
+    let target_market = match ctx.target_market_id
+        .map(|s| s.to_string())
+        .or_else(|| ctx.state.primary_market_id.clone())
+        .and_then(|id| ctx.markets.iter().find(|m| m.id == id).cloned())
+    {
+        Some(m) => m,
+        None => return ExecOutcome::Skipped {
+            reason: "couldn't resolve market for signing".to_string(),
+        },
     };
-    let price_cents = price_to_cents(target.price);
-    let key = PoolKey { asset_id, side: Side::Buy, price_cents };
-    let signed = match ctx.pool.take(&key) {
-        Some(s) => s,
-        None => {
-            let reason = format!(
-                "no pre-signed order at {}c on {}",
-                price_cents,
-                target.side.as_str(),
-            );
-            tracing::warn!(reason = %reason, "execute_signal skipped — pool miss");
-            return ExecOutcome::Skipped { reason };
+    let signed = match sign_kelly_buy(ctx, &target_market, target.side, bet, target.price) {
+        Ok(s)  => s,
+        Err(e) => {
+            tracing::error!(error = %e, "sign_kelly_buy failed");
+            return ExecOutcome::Skipped { reason: format!("sign failed: {e}") };
         }
     };
 
@@ -243,6 +281,55 @@ pub async fn execute_signal(
     }
 }
 
+/// G5: Sign one BUY order at exact `bet_dollars` for the given side + price.
+/// Used by both the oracle path and each leg of intramarket arb.
+///
+/// Returns the signed order or a human-readable error string for logging.
+fn sign_kelly_buy(
+    ctx:    &ExecContext<'_>,
+    market: &PolyMarket,
+    side:   SideLabel,
+    bet:    f64,
+    price:  f64,
+) -> Result<SignedOrder, String> {
+    let token_id_str = match side {
+        SideLabel::Yes => &market.up_token_id,
+        SideLabel::No  => &market.down_token_id,
+    };
+    let asset_id = u256_from_dec(token_id_str)
+        .map_err(|e| format!("token id parse: {e}"))?;
+    let signer = private_key_to_address(&ctx.signing.private_key_hex)
+        .map_err(|e| format!("derive signer: {e}"))?;
+    let maker = match (ctx.signing.signature_type, ctx.signing.funder_address.as_deref()) {
+        (SignatureType::Eoa, _) => signer,
+        (_, Some(a))            => hex_to_address(a)
+            .map_err(|e| format!("parse funder: {e}"))?,
+        (sig, None) => return Err(format!("{:?} sig type requires funder_address", sig)),
+    };
+    let price_cents = price_to_cents(price);
+
+    let inputs = BuyOrderInputs {
+        asset_id,
+        maker,
+        signer,
+        taker:           ctx.signing.taker,
+        bet_dollars:     bet,
+        price_cents,
+        // Window-bound expiration so an unfilled order can't carry over.
+        expiration_unix: market.close_time_ms / 1000,
+        nonce:           ctx.signing.nonce,
+        fee_rate_bps:    ctx.signing.fee_rate_bps,
+        signature_type:  ctx.signing.signature_type,
+    };
+    sign_buy_now(&inputs, &ctx.signing.domain, &ctx.signing.private_key_hex)
+        .map_err(|e| format!("sign_buy_now: {e}"))
+}
+
+// Suppress dead_code warnings on `signer` — used only in the format!()
+// at the moment, but kept reachable for future code.
+#[allow(dead_code)]
+fn _signer_warmup_for_lint(addr: &[u8; 20]) -> String { address_to_hex(addr) }
+
 /// Build a deterministic local order id from the pre-signed salt — used when
 /// Polymarket does not return an order_id (DRY_RUN, or 4xx rejections).
 /// Format: "local-<16 hex chars from low-8 bytes of salt>"
@@ -295,44 +382,18 @@ pub async fn execute_intramarket(
         return ExecOutcome::Skipped { reason: format!("risk: {e}") };
     }
 
-    // 4. Look up both pre-signed orders
-    let yes_asset = match u256_from_dec(&market.up_token_id) {
-        Ok(id) => id,
+    // 4. Sign both legs on demand at exact per_leg_bet (G5).
+    let yes_signed = match sign_kelly_buy(ctx, market, SideLabel::Yes, per_leg_bet, sig.yes_ask) {
+        Ok(s)  => s,
         Err(e) => return ExecOutcome::Skipped {
-            reason: format!("yes token id parse: {e}"),
+            reason: format!("sign YES leg: {e}"),
         },
     };
-    let no_asset = match u256_from_dec(&market.down_token_id) {
-        Ok(id) => id,
+    let no_signed = match sign_kelly_buy(ctx, market, SideLabel::No, per_leg_bet, sig.no_ask) {
+        Ok(s)  => s,
         Err(e) => return ExecOutcome::Skipped {
-            reason: format!("no token id parse: {e}"),
+            reason: format!("sign NO leg: {e}"),
         },
-    };
-    let yes_cents = price_to_cents(sig.yes_ask);
-    let no_cents  = price_to_cents(sig.no_ask);
-    let yes_key = PoolKey { asset_id: yes_asset, side: Side::Buy, price_cents: yes_cents };
-    let no_key  = PoolKey { asset_id: no_asset,  side: Side::Buy, price_cents: no_cents  };
-
-    let yes_signed = match ctx.pool.take(&yes_key) {
-        Some(s) => s,
-        None => return ExecOutcome::Skipped {
-            reason: format!("no pre-signed YES order at {yes_cents}c"),
-        },
-    };
-    let no_signed = match ctx.pool.take(&no_key) {
-        Some(s) => s,
-        None => {
-            // CRITICAL: we already consumed the yes slot. Putting it back is
-            // not safe (salts are one-shot in design), so we log and skip.
-            tracing::warn!(
-                "intramarket aborted: NO leg pool miss after YES leg taken \
-                 — YES slot at {}c is now unused (salt won't be reused)",
-                yes_cents,
-            );
-            return ExecOutcome::Skipped {
-                reason: format!("no pre-signed NO order at {no_cents}c (yes slot wasted)"),
-            };
-        }
     };
 
     // 5. Concurrent submit — tokio::join runs both HTTP calls in parallel
@@ -443,7 +504,6 @@ fn handle_leg_result(
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 struct Target {
-    token_id: String,
     price:    f64,
     p_win:    f64,
     side:     SideLabel,
@@ -470,16 +530,17 @@ fn resolve_target(
         .map(|s| s.to_string())
         .or_else(|| state.primary_market_id.clone())
         .ok_or_else(|| "no market specified (no target or primary)".to_string())?;
-    let market = markets.iter().find(|m| m.id == market_id)
+    // Verify the market exists, even though we don't need its body here —
+    // execute_signal does the real lookup later.
+    let _market = markets.iter().find(|m| m.id == market_id)
         .ok_or_else(|| format!("market {market_id} not in market list"))?;
 
-    let (token_id, side) = match oracle.direction {
-        Direction::Up   => (market.up_token_id.clone(),   SideLabel::Yes),
-        Direction::Down => (market.down_token_id.clone(), SideLabel::No),
+    let side = match oracle.direction {
+        Direction::Up   => SideLabel::Yes,
+        Direction::Down => SideLabel::No,
     };
 
     Ok(Target {
-        token_id,
         price:    oracle.market_price,
         p_win:    oracle.fair_value,
         side,
@@ -700,6 +761,20 @@ mod tests {
         pool.populate_around_midpoint(&domain, &params, TEST_PK, 50, 15).unwrap();
     }
 
+    /// G5: SigningParams configured with the Hardhat test key. EOA mode →
+    /// no funder address. Used in every test that builds an ExecContext.
+    fn sample_signing() -> SigningParams {
+        SigningParams {
+            domain:          Domain::polymarket_polygon(),
+            private_key_hex: TEST_PK.to_string(),
+            signature_type:  SignatureType::Eoa,
+            funder_address:  None,
+            nonce:           0,
+            fee_rate_bps:    0,
+            taker:           [0u8; 20],
+        }
+    }
+
     fn make_client_dry_run() -> ClobClient {
         let cfg = ClobConfig::new(TEST_ADDR, sample_creds(), /*dry_run=*/true);
         ClobClient::new(cfg).unwrap()
@@ -761,7 +836,8 @@ mod tests {
         let st  = sample_state();
         let mk  = vec![sample_market()];
         let t = resolve_target(&dec, &st, &mk, None).unwrap();
-        assert_eq!(t.token_id, UP_TOKEN_ID);
+        // After G5: Target no longer carries token_id (sign_kelly_buy looks
+        // it up directly from the market). Side is the source of truth.
         assert_eq!(t.side, SideLabel::Yes);
         assert!((t.price - 0.45).abs() < 1e-9);
         assert!((t.p_win - 0.85).abs() < 1e-9);
@@ -771,7 +847,6 @@ mod tests {
     fn resolve_target_picks_down_token_for_down_signal() {
         let dec = oracle_down_signal(0.50, 0.80);
         let t = resolve_target(&dec, &sample_state(), &[sample_market()], None).unwrap();
-        assert_eq!(t.token_id, DOWN_TOKEN_ID);
         assert_eq!(t.side, SideLabel::No);
     }
 
@@ -810,10 +885,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_signal_submits_oracle_up_in_dry_run() {
-        let pool = OrderPool::new();
-        populate_pool_for_market(&pool, UP_TOKEN_ID);
-        let pool_size_before = pool.len();
-
+        let signing = sample_signing();
         let risk    = RiskLimits::new();
         let cfg     = RiskConfig::default();
         let client  = make_client_dry_run();
@@ -823,7 +895,7 @@ mod tests {
         let ctx = ExecContext {
             state: &state, markets: &markets,
             risk: &risk, risk_cfg: &cfg,
-            pool: &pool, client: &client,
+            signing: &signing, client: &client,
             positions: None, target_market_id: None,
         };
 
@@ -841,8 +913,6 @@ mod tests {
             other => panic!("expected Submitted, got {other:?}"),
         }
 
-        // Pool was decremented by exactly one
-        assert_eq!(pool.len(), pool_size_before - 1);
         // DRY_RUN must NOT consume daily trade count or exposure budget —
         // otherwise after max_daily_trades fake signals the bot would block
         // a real trade if the user flips DRY_RUN off without resetting state.
@@ -852,7 +922,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_signal_routes_down_to_no_token() {
-        let pool = OrderPool::new();
+        let pool = OrderPool::new(); let signing = sample_signing();
         populate_pool_for_market(&pool, DOWN_TOKEN_ID);
 
         let risk    = RiskLimits::new();
@@ -863,7 +933,7 @@ mod tests {
         let ctx = ExecContext {
             state: &state, markets: &markets,
             risk: &risk, risk_cfg: &cfg,
-            pool: &pool, client: &client,
+            signing: &signing, client: &client,
             positions: None, target_market_id: None,
         };
         let dec = oracle_down_signal(0.55, 0.90);
@@ -878,13 +948,13 @@ mod tests {
 
     #[tokio::test]
     async fn execute_signal_skips_when_no_signal() {
-        let pool = OrderPool::new();
+        let _ = OrderPool::new(); let signing = sample_signing();
         let risk = RiskLimits::new();
         let cfg = RiskConfig::default();
         let client = make_client_dry_run();
         let state = sample_state();
         let markets = vec![sample_market()];
-        let ctx = ExecContext { state: &state, markets: &markets, risk: &risk, risk_cfg: &cfg, pool: &pool, client: &client, positions: None, target_market_id: None };
+        let ctx = ExecContext { state: &state, markets: &markets, risk: &risk, risk_cfg: &cfg, signing: &signing, client: &client, positions: None, target_market_id: None };
 
         let outcome = execute_signal(&SignalDecision::None, &ctx).await;
         assert!(matches!(outcome, ExecOutcome::Skipped { .. }));
@@ -893,7 +963,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_signal_skips_when_kelly_returns_zero() {
-        let pool = OrderPool::new();
+        let pool = OrderPool::new(); let signing = sample_signing();
         populate_pool_for_market(&pool, UP_TOKEN_ID);
         let pool_size_before = pool.len();
 
@@ -902,7 +972,7 @@ mod tests {
         let client = make_client_dry_run();
         let state = sample_state();
         let markets = vec![sample_market()];
-        let ctx = ExecContext { state: &state, markets: &markets, risk: &risk, risk_cfg: &cfg, pool: &pool, client: &client, positions: None, target_market_id: None };
+        let ctx = ExecContext { state: &state, markets: &markets, risk: &risk, risk_cfg: &cfg, signing: &signing, client: &client, positions: None, target_market_id: None };
 
         // fair_value < market_price → no edge → kelly = 0
         let dec = oracle_up_signal(0.55, 0.45);
@@ -914,7 +984,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_signal_skips_when_risk_kill_switch_active() {
-        let pool = OrderPool::new();
+        let pool = OrderPool::new(); let signing = sample_signing();
         populate_pool_for_market(&pool, UP_TOKEN_ID);
         let pool_size_before = pool.len();
 
@@ -924,7 +994,7 @@ mod tests {
         let client = make_client_dry_run();
         let state = sample_state();
         let markets = vec![sample_market()];
-        let ctx = ExecContext { state: &state, markets: &markets, risk: &risk, risk_cfg: &cfg, pool: &pool, client: &client, positions: None, target_market_id: None };
+        let ctx = ExecContext { state: &state, markets: &markets, risk: &risk, risk_cfg: &cfg, signing: &signing, client: &client, positions: None, target_market_id: None };
 
         let dec = oracle_up_signal(0.45, 0.85);
         let outcome = execute_signal(&dec, &ctx).await;
@@ -937,32 +1007,74 @@ mod tests {
         assert_eq!(risk.daily_trade_count(), 0);
     }
 
-    #[tokio::test]
-    async fn execute_signal_skips_when_pool_has_no_entry_at_price() {
-        // Pool populated for 35..=65, but signal price is 80¢ — outside range.
-        let pool = OrderPool::new();
-        populate_pool_for_market(&pool, UP_TOKEN_ID);
-        let pool_size_before = pool.len();
+    // Note: G5 made `execute_signal_skips_when_pool_has_no_entry_at_price`
+    // obsolete. Sign-on-demand handles arbitrary tick prices — there's no
+    // pool to miss.
 
+    #[tokio::test]
+    async fn execute_signal_submits_at_arbitrary_tick_g5() {
+        // G5 regression test: a signal at 80¢ used to miss the pre-signed
+        // pool (which only covered ±15c around midpoint). Now we sign on
+        // demand and the submit succeeds.
+        let signing = sample_signing();
         let risk = RiskLimits::new();
         let cfg = RiskConfig::default();
         let client = make_client_dry_run();
         let state = sample_state();
         let markets = vec![sample_market()];
-        let ctx = ExecContext { state: &state, markets: &markets, risk: &risk, risk_cfg: &cfg, pool: &pool, client: &client, positions: None, target_market_id: None };
+        let ctx = ExecContext { state: &state, markets: &markets, risk: &risk, risk_cfg: &cfg, signing: &signing, client: &client, positions: None, target_market_id: None };
 
         let dec = oracle_up_signal(0.80, 0.95);
         let outcome = execute_signal(&dec, &ctx).await;
-        assert!(matches!(outcome, ExecOutcome::Skipped { .. }));
-        // Pool size unchanged (no take)
-        assert_eq!(pool.len(), pool_size_before);
-        // No exposure recorded
-        assert_eq!(risk.daily_trade_count(), 0);
+        assert!(matches!(outcome, ExecOutcome::Submitted { .. }),
+            "G5: any tick price should submit, got {outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn execute_signal_kelly_sizing_is_honored_g5() {
+        // G5 regression test: when Kelly says less than max_bet, we should
+        // bet the kelly amount, not max_bet. Previously the pre-signed pool
+        // forced every bet to max_bet — Kelly was effectively bypassed.
+        let signing = sample_signing();
+        let risk = RiskLimits::new();
+        let mut cfg = RiskConfig::default();
+        // Tweak so Kelly returns less than max_bet for this signal
+        cfg.bankroll       = 100.0;
+        cfg.kelly_fraction = 0.10;
+        cfg.max_bet_dollars = 30.0;
+        let client = make_client_dry_run();
+        let state = sample_state();
+        let markets = vec![sample_market()];
+        let positions = temp_positions();
+        let ctx = ExecContext {
+            state: &state, markets: &markets,
+            risk: &risk, risk_cfg: &cfg,
+            signing: &signing, client: &client,
+            positions: Some(&positions), target_market_id: None,
+        };
+
+        // p_win=0.55 at price=0.50 → kelly_full ≈ 0.10 → kelly_frac = 0.01
+        // → raw bet = $1 → far below max_bet_dollars
+        let dec = oracle_up_signal(0.50, 0.55);
+        let outcome = execute_signal(&dec, &ctx).await;
+        match outcome {
+            ExecOutcome::Submitted { bet_dollars, .. } => {
+                assert!(bet_dollars < cfg.max_bet_dollars,
+                    "G5: bet ${} should be < max_bet ${}", bet_dollars, cfg.max_bet_dollars);
+                assert!(bet_dollars > 0.0);
+            }
+            other => panic!("expected Submitted, got {other:?}"),
+        }
+        // Position recorded at the SMALL kelly amount, not max_bet
+        let p = positions.all().into_iter().next().unwrap();
+        assert!(p.bet_dollars < cfg.max_bet_dollars * 0.5,
+            "G5: recorded bet ${} should be much less than max ${}",
+            p.bet_dollars, cfg.max_bet_dollars);
     }
 
     #[tokio::test]
     async fn execute_signal_skips_when_market_unknown() {
-        let pool = OrderPool::new();
+        let pool = OrderPool::new(); let signing = sample_signing();
         populate_pool_for_market(&pool, UP_TOKEN_ID);
         let risk = RiskLimits::new();
         let cfg = RiskConfig::default();
@@ -970,7 +1082,7 @@ mod tests {
         let state = sample_state();
         // Empty markets list — primary_market_id won't resolve.
         let markets: Vec<PolyMarket> = vec![];
-        let ctx = ExecContext { state: &state, markets: &markets, risk: &risk, risk_cfg: &cfg, pool: &pool, client: &client, positions: None, target_market_id: None };
+        let ctx = ExecContext { state: &state, markets: &markets, risk: &risk, risk_cfg: &cfg, signing: &signing, client: &client, positions: None, target_market_id: None };
         let dec = oracle_up_signal(0.45, 0.85);
         let outcome = execute_signal(&dec, &ctx).await;
         assert!(matches!(outcome, ExecOutcome::Skipped { .. }));
@@ -982,7 +1094,7 @@ mod tests {
     async fn risk_denial_does_not_consume_pool_slot() {
         // Two back-to-back attempts: first is denied (kill switch), second
         // succeeds. The single populated slot must still be available for #2.
-        let pool = OrderPool::new();
+        let pool = OrderPool::new(); let signing = sample_signing();
         populate_pool_for_market(&pool, UP_TOKEN_ID);
 
         let risk = RiskLimits::new();
@@ -991,7 +1103,7 @@ mod tests {
         let client = make_client_dry_run();
         let state = sample_state();
         let markets = vec![sample_market()];
-        let ctx = ExecContext { state: &state, markets: &markets, risk: &risk, risk_cfg: &cfg, pool: &pool, client: &client, positions: None, target_market_id: None };
+        let ctx = ExecContext { state: &state, markets: &markets, risk: &risk, risk_cfg: &cfg, signing: &signing, client: &client, positions: None, target_market_id: None };
 
         let dec = oracle_up_signal(0.45, 0.85);
         let _ = execute_signal(&dec, &ctx).await;        // denied
@@ -1022,7 +1134,7 @@ mod tests {
 
     #[test]
     fn populate_pool_for_window_signs_both_sides() {
-        let pool = OrderPool::new();
+        let pool = OrderPool::new(); let _ = sample_signing();
         let market = sample_market();
         let setup = sample_setup(&market);
         let counts = populate_pool_for_window(&pool, &setup).unwrap();
@@ -1034,7 +1146,7 @@ mod tests {
 
     #[test]
     fn populate_pool_for_window_keys_yes_under_up_token() {
-        let pool = OrderPool::new();
+        let pool = OrderPool::new(); let _ = sample_signing();
         let market = sample_market();
         let setup = sample_setup(&market);
         populate_pool_for_window(&pool, &setup).unwrap();
@@ -1058,7 +1170,7 @@ mod tests {
 
     #[test]
     fn populate_pool_for_window_rejects_bad_private_key() {
-        let pool = OrderPool::new();
+        let pool = OrderPool::new(); let _ = sample_signing();
         let market = sample_market();
         let mut setup = sample_setup(&market);
         setup.private_key_hex = "0xnotvalid".to_string();
@@ -1068,7 +1180,7 @@ mod tests {
 
     #[test]
     fn populate_pool_for_window_rejects_bad_token_id() {
-        let pool = OrderPool::new();
+        let pool = OrderPool::new(); let _ = sample_signing();
         let mut market = sample_market();
         market.up_token_id = "not-a-decimal".to_string();
         let setup = sample_setup(&market);
@@ -1088,7 +1200,7 @@ mod tests {
 
     #[test]
     fn populate_pool_uses_funder_for_polyproxy() {
-        let pool = OrderPool::new();
+        let pool = OrderPool::new(); let _ = sample_signing();
         let market = sample_market();
         let funder_hex = "0x1111111111111111111111111111111111111111";
         let mut setup = sample_setup(&market);
@@ -1110,7 +1222,7 @@ mod tests {
 
     #[test]
     fn populate_pool_polyproxy_without_funder_is_rejected() {
-        let pool = OrderPool::new();
+        let pool = OrderPool::new(); let _ = sample_signing();
         let market = sample_market();
         let mut setup = sample_setup(&market);
         setup.signature_type = SignatureType::PolyProxy;
@@ -1121,7 +1233,7 @@ mod tests {
 
     #[test]
     fn populate_pool_for_window_clamps_midpoint_at_edge() {
-        let pool = OrderPool::new();
+        let pool = OrderPool::new(); let _ = sample_signing();
         let market = sample_market();
         let mut setup = sample_setup(&market);
         // Extreme midpoint near 0 → window clamps to 1..=15+midpoint_cents
@@ -1133,7 +1245,7 @@ mod tests {
     // J8: end-to-end — populate via window helper, then execute_signal succeeds.
     #[tokio::test]
     async fn end_to_end_window_setup_then_oracle_execute() {
-        let pool = OrderPool::new();
+        let pool = OrderPool::new(); let signing = sample_signing();
         let market = sample_market();
 
         let counts = populate_pool_for_window(&pool, &sample_setup(&market)).unwrap();
@@ -1147,7 +1259,7 @@ mod tests {
         let ctx = ExecContext {
             state: &state, markets: &markets,
             risk: &risk, risk_cfg: &cfg,
-            pool: &pool, client: &client,
+            signing: &signing, client: &client,
             positions: None, target_market_id: None,
         };
 
@@ -1185,7 +1297,7 @@ mod tests {
             }
         });
 
-        let pool = OrderPool::new();
+        let pool = OrderPool::new(); let signing = sample_signing();
         populate_pool_for_market(&pool, UP_TOKEN_ID);
 
         let mut clob_cfg = crate::execution::clob::ClobConfig::new(TEST_ADDR, sample_creds(), false);
@@ -1201,7 +1313,7 @@ mod tests {
         let ctx = ExecContext {
             state: &state, markets: &markets,
             risk: &risk, risk_cfg: &cfg,
-            pool: &pool, client: &client,
+            signing: &signing, client: &client,
             positions: None, target_market_id: None,
         };
 
@@ -1229,7 +1341,7 @@ mod tests {
 
     #[tokio::test]
     async fn submitted_outcome_records_open_to_position_store() {
-        let pool = OrderPool::new();
+        let pool = OrderPool::new(); let signing = sample_signing();
         populate_pool_for_market(&pool, UP_TOKEN_ID);
         let risk    = RiskLimits::new();
         let cfg     = RiskConfig::default();
@@ -1240,7 +1352,7 @@ mod tests {
         let ctx = ExecContext {
             state: &state, markets: &markets,
             risk: &risk, risk_cfg: &cfg,
-            pool: &pool, client: &client,
+            signing: &signing, client: &client,
             positions: Some(&positions), target_market_id: None,
         };
 
@@ -1277,7 +1389,7 @@ mod tests {
             }
         });
 
-        let pool = OrderPool::new();
+        let pool = OrderPool::new(); let signing = sample_signing();
         populate_pool_for_market(&pool, UP_TOKEN_ID);
         let mut clob_cfg = crate::execution::clob::ClobConfig::new(TEST_ADDR, sample_creds(), false);
         clob_cfg.base_url = format!("http://{}", addr);
@@ -1293,7 +1405,7 @@ mod tests {
         let ctx = ExecContext {
             state: &state, markets: &markets,
             risk: &risk, risk_cfg: &cfg,
-            pool: &pool, client: &client,
+            signing: &signing, client: &client,
             positions: Some(&positions), target_market_id: None,
         };
 
@@ -1311,7 +1423,7 @@ mod tests {
     #[tokio::test]
     async fn skipped_outcomes_do_not_touch_position_store() {
         // No signal → Skipped → ledger should be empty
-        let pool = OrderPool::new();
+        let _ = OrderPool::new(); let signing = sample_signing();
         let risk = RiskLimits::new();
         let cfg = RiskConfig::default();
         let client = make_client_dry_run();
@@ -1321,7 +1433,7 @@ mod tests {
         let ctx = ExecContext {
             state: &state, markets: &markets,
             risk: &risk, risk_cfg: &cfg,
-            pool: &pool, client: &client,
+            signing: &signing, client: &client,
             positions: Some(&positions), target_market_id: None,
         };
         let _ = execute_signal(&SignalDecision::None, &ctx).await;
@@ -1349,7 +1461,7 @@ mod tests {
         let markets = vec![sample_market(), other.clone()];
 
         // Pre-sign for the OTHER market's up_token, not the primary's
-        let pool = OrderPool::new();
+        let pool = OrderPool::new(); let signing = sample_signing();
         populate_pool_for_market(&pool, &other.up_token_id);
 
         let risk = RiskLimits::new();
@@ -1359,7 +1471,7 @@ mod tests {
         let ctx = ExecContext {
             state: &state, markets: &markets,
             risk: &risk, risk_cfg: &cfg,
-            pool: &pool, client: &client,
+            signing: &signing, client: &client,
             positions: None,
             target_market_id: Some(other_id.as_str()),
         };
@@ -1384,12 +1496,7 @@ mod tests {
 
     #[tokio::test]
     async fn intramarket_submits_both_legs() {
-        let pool = OrderPool::new();
-        // Pre-sign for BOTH up and down tokens
-        populate_pool_for_market(&pool, UP_TOKEN_ID);
-        populate_pool_for_market(&pool, DOWN_TOKEN_ID);
-        let pool_size_before = pool.len();
-
+        let signing = sample_signing();
         let positions = temp_positions();
         let risk    = RiskLimits::new();
         let cfg     = RiskConfig::default();
@@ -1399,7 +1506,7 @@ mod tests {
         let ctx = ExecContext {
             state: &state, markets: &markets,
             risk: &risk, risk_cfg: &cfg,
-            pool: &pool, client: &client,
+            signing: &signing, client: &client,
             positions: Some(&positions),
             target_market_id: None,
         };
@@ -1412,59 +1519,26 @@ mod tests {
             }
             other => panic!("expected Submitted, got {other:?}"),
         }
-        // Both pool slots consumed
-        assert_eq!(pool.len(), pool_size_before - 2);
-        // Both legs recorded
+        // Both legs recorded — sign-on-demand at half-Kelly each
         assert_eq!(positions.len(), 2);
         let all = positions.all();
         let sides: std::collections::HashSet<&str> =
             all.iter().map(|p| p.side.as_str()).collect();
         assert!(sides.contains("yes"));
         assert!(sides.contains("no"));
-    }
-
-    #[tokio::test]
-    async fn intramarket_skipped_when_only_yes_pre_signed() {
-        // YES pre-signed, NO is missing — must abort cleanly. The yes slot
-        // gets consumed because we take it before checking no (race-safe
-        // pattern in production where the take is atomic).
-        let pool = OrderPool::new();
-        populate_pool_for_market(&pool, UP_TOKEN_ID);
-
-        let positions = temp_positions();
-        let risk    = RiskLimits::new();
-        let cfg     = RiskConfig::default();
-        let client  = make_client_dry_run();
-        let state   = sample_state();
-        let markets = vec![sample_market()];
-        let ctx = ExecContext {
-            state: &state, markets: &markets,
-            risk: &risk, risk_cfg: &cfg,
-            pool: &pool, client: &client,
-            positions: Some(&positions),
-            target_market_id: None,
-        };
-
-        let dec = intramarket_signal(0.40, 0.42);
-        let outcome = execute_signal(&dec, &ctx).await;
-        match outcome {
-            ExecOutcome::Skipped { reason } => {
-                assert!(reason.contains("NO order"), "reason was: {reason}");
-            }
-            other => panic!("expected Skipped, got {other:?}"),
+        // G5 sanity: each leg sized at max_bet/2, NOT max_bet
+        for p in &all {
+            assert!((p.bet_dollars - cfg.max_bet_dollars * 0.5).abs() < 0.01,
+                "leg should be ~half max_bet, got ${}", p.bet_dollars);
         }
-        // Risk gate cleared, but no positions recorded (NO leg never submitted,
-        // YES leg pool slot was consumed but submit never happened)
-        assert_eq!(positions.len(), 0);
     }
 
-    #[tokio::test]
-    async fn intramarket_skipped_on_kill_switch_before_taking_pool() {
-        let pool = OrderPool::new();
-        populate_pool_for_market(&pool, UP_TOKEN_ID);
-        populate_pool_for_market(&pool, DOWN_TOKEN_ID);
-        let pool_size_before = pool.len();
+    // Note: G5 made `intramarket_skipped_when_only_yes_pre_signed` obsolete.
+    // The pool-miss path no longer exists — both legs sign on demand.
 
+    #[tokio::test]
+    async fn intramarket_skipped_on_kill_switch_before_signing() {
+        let signing = sample_signing();
         let risk = RiskLimits::new();
         risk.activate_kill_switch();   // pre-trip
         let positions = temp_positions();
@@ -1475,7 +1549,7 @@ mod tests {
         let ctx = ExecContext {
             state: &state, markets: &markets,
             risk: &risk, risk_cfg: &cfg,
-            pool: &pool, client: &client,
+            signing: &signing, client: &client,
             positions: Some(&positions),
             target_market_id: None,
         };
@@ -1486,8 +1560,7 @@ mod tests {
             ExecOutcome::Skipped { reason } => assert!(reason.contains("kill switch")),
             other => panic!("expected Skipped, got {other:?}"),
         }
-        // Pool MUST be untouched — kill switch fires before pool.take
-        assert_eq!(pool.len(), pool_size_before);
+        // Kill switch fires before any signing — no positions touched.
         assert_eq!(positions.len(), 0);
     }
 
@@ -1503,24 +1576,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn second_call_at_same_price_reports_pool_miss() {
-        let pool = OrderPool::new();
-        populate_pool_for_market(&pool, UP_TOKEN_ID);
+    async fn two_consecutive_submits_at_same_price_both_succeed_g5() {
+        // G5 regression: under sign-on-demand, two consecutive identical
+        // signals BOTH submit (each gets a fresh salt). Replaces the old
+        // "pool miss on second call" test.
+        let signing = sample_signing();
         let risk = RiskLimits::new();
         let cfg = RiskConfig::default();
         let client = make_client_dry_run();
         let state = sample_state();
         let markets = vec![sample_market()];
-        let ctx = ExecContext { state: &state, markets: &markets, risk: &risk, risk_cfg: &cfg, pool: &pool, client: &client, positions: None, target_market_id: None };
+        let ctx = ExecContext { state: &state, markets: &markets, risk: &risk, risk_cfg: &cfg, signing: &signing, client: &client, positions: None, target_market_id: None };
 
         let dec = oracle_up_signal(0.45, 0.85);
         let first = execute_signal(&dec, &ctx).await;
-        assert!(matches!(first, ExecOutcome::Submitted { .. }));
-        // Same key should now be missing
         let second = execute_signal(&dec, &ctx).await;
-        match second {
-            ExecOutcome::Skipped { reason } => assert!(reason.contains("no pre-signed")),
-            other => panic!("expected Skipped(pool miss), got {other:?}"),
-        }
+        assert!(matches!(first,  ExecOutcome::Submitted { .. }));
+        assert!(matches!(second, ExecOutcome::Submitted { .. }));
     }
 }

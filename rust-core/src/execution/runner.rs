@@ -26,8 +26,7 @@ use tokio::sync::RwLock;
 use tokio::time::{Duration, MissedTickBehavior};
 
 use crate::execution::clob::ClobClient;
-use crate::execution::executor::{execute_signal, ExecContext};
-use crate::execution::presign::OrderPool;
+use crate::execution::executor::{execute_signal, ExecContext, SigningParams};
 use crate::features::FeatureState;
 use crate::risk::limits::{RiskConfig, RiskLimits};
 use crate::signals::{evaluate_all_markets, SignalConfig, SignalDecision};
@@ -62,7 +61,7 @@ impl Default for RunnerConfig {
 pub async fn execution_runner_loop(
     state:       Arc<RwLock<FeatureState>>,
     markets:     Arc<RwLock<Vec<PolyMarket>>>,
-    pool:        Arc<OrderPool>,
+    signing:     Arc<SigningParams>,
     risk:        Arc<RiskLimits>,
     risk_cfg:    RiskConfig,
     sig_cfg:     SignalConfig,
@@ -135,7 +134,7 @@ pub async fn execution_runner_loop(
             in_flight.fetch_add(1, std::sync::atomic::Ordering::Release);
 
             // Spawn — every signal executes in parallel.
-            let pool_c   = pool.clone();
+            let sign_c   = signing.clone();
             let risk_c   = risk.clone();
             let client_c = client.clone();
             let pos_c    = positions.clone();
@@ -151,7 +150,7 @@ pub async fn execution_runner_loop(
                     markets:  &m_snap,
                     risk:     &risk_c,
                     risk_cfg: &risk_cfg_c,
-                    pool:     &pool_c,
+                    signing:  &sign_c,
                     client:   &client_c,
                     positions:        Some(&pos_c),
                     target_market_id: Some(&market_id_c),
@@ -190,7 +189,7 @@ fn summarize_outcome(o: &crate::execution::executor::ExecOutcome) -> &'static st
 pub async fn run_one_tick(
     state:       &Arc<RwLock<FeatureState>>,
     markets:     &Arc<RwLock<Vec<PolyMarket>>>,
-    pool:        &Arc<OrderPool>,
+    signing:     &Arc<SigningParams>,
     risk:        &Arc<RiskLimits>,
     risk_cfg:    &RiskConfig,
     sig_cfg:     &SignalConfig,
@@ -217,7 +216,7 @@ pub async fn run_one_tick(
         }
         last_submit.insert(market_id.clone(), now_ms);
 
-        let pool_c   = pool.clone();
+        let sign_c   = signing.clone();
         let risk_c   = risk.clone();
         let client_c = client.clone();
         let pos_c    = positions.clone();
@@ -232,7 +231,7 @@ pub async fn run_one_tick(
                 markets:  &m_snap,
                 risk:     &risk_c,
                 risk_cfg: &risk_cfg_c,
-                pool:     &pool_c,
+                signing:  &sign_c,
                 client:   &client_c,
                 positions:        Some(&pos_c),
                 target_market_id: Some(&market_id_c),
@@ -256,8 +255,7 @@ mod tests {
     use super::*;
     use crate::execution::auth::ApiCreds;
     use crate::execution::clob::{ClobClient, ClobConfig};
-    use crate::execution::orders::SignatureType;
-    use crate::execution::executor::{populate_pool_for_window, WindowSetup};
+    use crate::execution::orders::{Domain, SignatureType};
     use crate::features::BookState;
     use base64::{engine::general_purpose::URL_SAFE, Engine as _};
 
@@ -312,10 +310,22 @@ mod tests {
         }
     }
 
+    fn sample_signing_arc() -> Arc<SigningParams> {
+        Arc::new(SigningParams {
+            domain:          Domain::polymarket_polygon(),
+            private_key_hex: TEST_PK.to_string(),
+            signature_type:  SignatureType::Eoa,
+            funder_address:  None,
+            nonce:           0,
+            fee_rate_bps:    0,
+            taker:           [0u8; 20],
+        })
+    }
+
     async fn setup_two_markets() -> (
         Arc<RwLock<FeatureState>>,
         Arc<RwLock<Vec<PolyMarket>>>,
-        Arc<OrderPool>,
+        Arc<SigningParams>,
         Arc<RiskLimits>,
         Arc<ClobClient>,
         Arc<PositionStore>,
@@ -339,36 +349,27 @@ mod tests {
         s.asset_books.insert(DOWN_M2.into(), book(0.50, 0.55));
 
         let state   = Arc::new(RwLock::new(s));
-        let markets = Arc::new(RwLock::new(vec![m1.clone(), m2.clone()]));
-        let pool    = Arc::new(OrderPool::new());
-
-        // Pre-sign for both markets
-        for m in [&m1, &m2] {
-            let setup = WindowSetup::for_market(
-                m, 0.45, 0.55, 5.0, 15, 0, 0,
-                SignatureType::Eoa, TEST_PK.to_string(), None,
-            );
-            populate_pool_for_window(&pool, &setup).unwrap();
-        }
+        let markets = Arc::new(RwLock::new(vec![m1, m2]));
+        let signing = sample_signing_arc();
 
         let risk = Arc::new(RiskLimits::new());
         let client = make_client();
         let positions = Arc::new(PositionStore::open(&temp_dir()).unwrap());
-        (state, markets, pool, risk, client, positions, now_ms)
+        (state, markets, signing, risk, client, positions, now_ms)
     }
 
     // ── Per-market dispatch ───────────────────────────────────────────────
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn one_tick_dispatches_to_all_markets_in_parallel() {
-        let (state, markets, pool, risk, client, positions, now_ms) = setup_two_markets().await;
+        let (state, markets, signing, risk, client, positions, now_ms) = setup_two_markets().await;
         let last_submit = Arc::new(DashMap::new());
         let mut sig_cfg = SignalConfig::default();
         sig_cfg.min_window_age_secs = 0.0;
         let runner_cfg = RunnerConfig::default();
 
         let outcomes = run_one_tick(
-            &state, &markets, &pool, &risk, &RiskConfig::default(),
+            &state, &markets, &signing, &risk, &RiskConfig::default(),
             &sig_cfg, &client, &positions, &last_submit, &runner_cfg, now_ms,
         ).await.unwrap();
 
@@ -385,7 +386,7 @@ mod tests {
 
     #[tokio::test]
     async fn cooldown_prevents_double_submit_on_same_market() {
-        let (state, markets, pool, risk, client, positions, now_ms) = setup_two_markets().await;
+        let (state, markets, signing, risk, client, positions, now_ms) = setup_two_markets().await;
         let last_submit = Arc::new(DashMap::new());
         let mut sig_cfg = SignalConfig::default();
         sig_cfg.min_window_age_secs = 0.0;
@@ -395,14 +396,14 @@ mod tests {
 
         // First tick — 2 submits
         let r1 = run_one_tick(
-            &state, &markets, &pool, &risk, &RiskConfig::default(),
+            &state, &markets, &signing, &risk, &RiskConfig::default(),
             &sig_cfg, &client, &positions, &last_submit, &runner_cfg, now_ms,
         ).await.unwrap();
         assert_eq!(r1.len(), 2);
 
         // Second tick within cooldown — both skipped
         let r2 = run_one_tick(
-            &state, &markets, &pool, &risk, &RiskConfig::default(),
+            &state, &markets, &signing, &risk, &RiskConfig::default(),
             &sig_cfg, &client, &positions, &last_submit, &runner_cfg,
             now_ms + 5_000,   // 5s later
         ).await.unwrap();
@@ -421,7 +422,7 @@ mod tests {
         // No window strike, no books → no oracle / intramarket fire
         let state   = Arc::new(RwLock::new(s));
         let markets = Arc::new(RwLock::new(vec![]));
-        let pool    = Arc::new(OrderPool::new());
+        let signing = sample_signing_arc();
         let risk    = Arc::new(RiskLimits::new());
         let client  = make_client();
         let positions = Arc::new(PositionStore::open(&temp_dir()).unwrap());
@@ -429,7 +430,7 @@ mod tests {
         let runner_cfg = RunnerConfig::default();
 
         let r = run_one_tick(
-            &state, &markets, &pool, &risk, &RiskConfig::default(),
+            &state, &markets, &signing, &risk, &RiskConfig::default(),
             &SignalConfig::default(), &client, &positions, &last_submit, &runner_cfg,
             chrono::Utc::now().timestamp_millis() as u64,
         ).await.unwrap();
@@ -455,7 +456,7 @@ mod tests {
     #[tokio::test]
     async fn cooldown_per_market_isolation() {
         // m1 in cooldown, m2 fresh — only m2 should fire
-        let (state, markets, pool, risk, client, positions, now_ms) = setup_two_markets().await;
+        let (state, markets, signing, risk, client, positions, now_ms) = setup_two_markets().await;
         let last_submit = Arc::new(DashMap::new());
         last_submit.insert("m1".to_string(), now_ms);   // pretend m1 just submitted
         let mut sig_cfg = SignalConfig::default();
@@ -463,7 +464,7 @@ mod tests {
         let runner_cfg = RunnerConfig::default();
 
         let r = run_one_tick(
-            &state, &markets, &pool, &risk, &RiskConfig::default(),
+            &state, &markets, &signing, &risk, &RiskConfig::default(),
             &sig_cfg, &client, &positions, &last_submit, &runner_cfg,
             now_ms + 1_000,
         ).await.unwrap();

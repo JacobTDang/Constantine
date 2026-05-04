@@ -161,68 +161,108 @@ fn random_salt() -> [u8; 32] {
     u256_from_u64(salt_u64)
 }
 
-/// Build a BUY order at a given 1¢ price tick, sized to `bet_dollars`.
+/// Inputs for building one BUY order. Standalone struct so callers don't
+/// need a full PopulateParams to sign a single order at an arbitrary
+/// bet size — used by the executor's Kelly-aware sign-on-demand path.
+#[derive(Debug, Clone)]
+pub struct BuyOrderInputs {
+    pub asset_id:        [u8; 32],
+    pub maker:           [u8; 20],
+    pub signer:          [u8; 20],
+    pub taker:           [u8; 20],
+    /// Per-order USDC. The amount kelly recommends for THIS specific
+    /// trade — not the bot's max_bet.
+    pub bet_dollars:     f64,
+    pub price_cents:     u8,
+    pub expiration_unix: u64,
+    pub nonce:           u64,
+    pub fee_rate_bps:    u64,
+    pub signature_type:  SignatureType,
+}
+
+/// Build + sign one BUY order at exactly `bet_dollars` for the given tick.
+/// This is the Kelly-aware path: caller decides the size, we sign at that
+/// size. Sign latency in release mode is ~150µs.
+pub fn sign_buy_now(
+    inputs:          &BuyOrderInputs,
+    domain:          &Domain,
+    private_key_hex: &str,
+) -> Result<SignedOrder> {
+    let order = build_buy_order_inner(inputs)?;
+    sign_order(order, domain, private_key_hex)
+        .with_context(|| format!("sign_buy_now at {}c", inputs.price_cents))
+}
+
+/// Internal: shared between build_buy_order (pool path) and sign_buy_now
+/// (Kelly path). Encapsulates the rust_decimal tick-aligned math.
 ///
-/// Uses `rust_decimal::Decimal` (not f64) so the maker_amount/taker_amount
-/// ratio matches a tick exactly. Mirrors rs-clob-client::OrderBuilder math:
-///
+/// Mirrors rs-clob-client::OrderBuilder:
 ///   size_shares    = trunc(bet_dollars / price, scale=LOT_SIZE_SCALE=2)
 ///   maker_amount   = trunc(size_shares * price, scale=USDC_DECIMALS+LOT_SIZE_SCALE=8)
 ///   maker_micros   = floor(maker_amount * 10^USDC_DECIMALS)
 ///   taker_micros   = floor(size_shares * 10^USDC_DECIMALS)
-///
-/// `maker_amount_micros` may be slightly less than `bet_dollars` for non-
-/// divisible prices — that's correct: tick alignment beats hitting exactly
-/// the kelly-suggested dollar amount.
-fn build_buy_order(params: &PopulateParams, price_cents: u8) -> Result<Order> {
-    if !(1..=99).contains(&price_cents) {
-        bail!("price_cents must be in 1..=99, got {}", price_cents);
+fn build_buy_order_inner(inputs: &BuyOrderInputs) -> Result<Order> {
+    if !(1..=99).contains(&inputs.price_cents) {
+        bail!("price_cents must be in 1..=99, got {}", inputs.price_cents);
     }
-    if !params.bet_dollars.is_finite() || params.bet_dollars <= 0.0 {
-        bail!("invalid bet_dollars: {}", params.bet_dollars);
+    if !inputs.bet_dollars.is_finite() || inputs.bet_dollars <= 0.0 {
+        bail!("invalid bet_dollars: {}", inputs.bet_dollars);
     }
 
-    // Convert bet_dollars to Decimal via cents-int — kelly_size always returns
-    // a 2-decimal value, so this is exact. Avoids f64 → Decimal drift.
-    let bet_cents = (params.bet_dollars * 100.0).round() as i64;
+    let bet_cents = (inputs.bet_dollars * 100.0).round() as i64;
     if bet_cents <= 0 {
-        bail!("bet too small after rounding to cents: {}", params.bet_dollars);
+        bail!("bet too small after rounding to cents: {}", inputs.bet_dollars);
     }
-    let bet_usd = Decimal::new(bet_cents, 2);                    // e.g. 5.00
-    let price   = Decimal::new(price_cents as i64, 2);            // e.g. 0.45
+    let bet_usd = Decimal::new(bet_cents, 2);
+    let price   = Decimal::new(inputs.price_cents as i64, 2);
 
-    // size_shares = bet / price, truncated to 2 decimal places (LOT_SIZE_SCALE)
     let size = (bet_usd / price).trunc_with_scale(LOT_SIZE_SCALE);
     if size.is_zero() {
         bail!(
             "size truncates to zero: bet ${} at {}c too small",
-            params.bet_dollars, price_cents,
+            inputs.bet_dollars, inputs.price_cents,
         );
     }
-
-    // maker_amount = size * price, truncated to 8 decimal places
     let maker_amount = (size * price).trunc_with_scale(USDC_DECIMALS + LOT_SIZE_SCALE);
 
-    // Convert to fixed-point u128 micros (10^USDC_DECIMALS)
     let maker_micros = decimal_to_micros(maker_amount)?;
     let taker_micros = decimal_to_micros(size)?;
     if maker_micros == 0 {
-        bail!("maker_micros is zero after rounding: bet ${}", params.bet_dollars);
+        bail!("maker_micros is zero after rounding: bet ${}", inputs.bet_dollars);
     }
 
     Ok(Order {
         salt:           random_salt(),
-        maker:          params.maker,
-        signer:         params.signer,
-        taker:          params.taker,
-        token_id:       params.asset_id,
+        maker:          inputs.maker,
+        signer:         inputs.signer,
+        taker:          inputs.taker,
+        token_id:       inputs.asset_id,
         maker_amount:   u256_from_u128(maker_micros),
         taker_amount:   u256_from_u128(taker_micros),
-        expiration:     u256_from_u64(params.expiration_unix),
-        nonce:          u256_from_u64(params.nonce),
-        fee_rate_bps:   u256_from_u64(params.fee_rate_bps),
+        expiration:     u256_from_u64(inputs.expiration_unix),
+        nonce:          u256_from_u64(inputs.nonce),
+        fee_rate_bps:   u256_from_u64(inputs.fee_rate_bps),
         side:           Side::Buy,
-        signature_type: params.signature_type,
+        signature_type: inputs.signature_type,
+    })
+}
+
+/// Build a BUY order at a given 1¢ price tick, sized to `bet_dollars`.
+///
+/// Wraps `build_buy_order_inner` for the pool path which works in
+/// PopulateParams (fixed bet across the ladder).
+fn build_buy_order(params: &PopulateParams, price_cents: u8) -> Result<Order> {
+    build_buy_order_inner(&BuyOrderInputs {
+        asset_id:        params.asset_id,
+        maker:           params.maker,
+        signer:          params.signer,
+        taker:           params.taker,
+        bet_dollars:     params.bet_dollars,
+        price_cents,
+        expiration_unix: params.expiration_unix,
+        nonce:           params.nonce,
+        fee_rate_bps:    params.fee_rate_bps,
+        signature_type:  params.signature_type,
     })
 }
 
@@ -498,6 +538,83 @@ mod tests {
         let params = sample_params();
         assert!(build_buy_order(&params, 0).is_err());
         assert!(build_buy_order(&params, 100).is_err());
+    }
+
+    // ── G5: sign_buy_now (Kelly-aware path) ──────────────────────────────
+
+    fn sample_inputs(bet: f64, price_cents: u8) -> BuyOrderInputs {
+        let p = sample_params();
+        BuyOrderInputs {
+            asset_id:        p.asset_id,
+            maker:           p.maker,
+            signer:          p.signer,
+            taker:           p.taker,
+            bet_dollars:     bet,
+            price_cents,
+            expiration_unix: 0,
+            nonce:           0,
+            fee_rate_bps:    0,
+            signature_type:  p.signature_type,
+        }
+    }
+
+    #[test]
+    fn sign_buy_now_returns_valid_signed_order() {
+        use crate::execution::orders::recover_signer;
+        let domain = Domain::polymarket_polygon();
+        let signed = sign_buy_now(&sample_inputs(5.0, 50), &domain, TEST_PK).unwrap();
+        // Signature recovers to the signer derived from TEST_PK
+        let expected = crate::execution::orders::hex_to_address(TEST_ADDR).unwrap();
+        let recovered = recover_signer(&domain, &signed).unwrap();
+        assert_eq!(recovered, expected);
+    }
+
+    #[test]
+    fn sign_buy_now_at_smaller_kelly_amount() {
+        // Kelly says $5 at 45¢ — sign exactly that, regardless of any
+        // pre-signed pool that may have $30 orders.
+        use crate::execution::orders::u256_to_dec;
+        let domain = Domain::polymarket_polygon();
+        let signed = sign_buy_now(&sample_inputs(5.0, 45), &domain, TEST_PK).unwrap();
+        // Math: 5/0.45 = 11.111... → trunc 11.11 shares
+        // maker = 11.11 * 0.45 = 4.9995 USDC
+        // micros: 4_999_500 maker, 11_110_000 taker
+        assert_eq!(u256_to_dec(&signed.order.maker_amount), "4999500");
+        assert_eq!(u256_to_dec(&signed.order.taker_amount), "11110000");
+    }
+
+    #[test]
+    fn sign_buy_now_each_call_has_unique_salt() {
+        // Two consecutive signs at identical inputs must produce distinct
+        // orders (different salts) so Polymarket doesn't reject duplicates.
+        let domain = Domain::polymarket_polygon();
+        let s1 = sign_buy_now(&sample_inputs(10.0, 50), &domain, TEST_PK).unwrap();
+        let s2 = sign_buy_now(&sample_inputs(10.0, 50), &domain, TEST_PK).unwrap();
+        assert_ne!(s1.order.salt, s2.order.salt);
+        assert_ne!(s1.signature, s2.signature);
+    }
+
+    #[test]
+    fn sign_buy_now_rejects_invalid_inputs() {
+        let domain = Domain::polymarket_polygon();
+        // bad bet
+        assert!(sign_buy_now(&sample_inputs(0.0, 50), &domain, TEST_PK).is_err());
+        assert!(sign_buy_now(&sample_inputs(-5.0, 50), &domain, TEST_PK).is_err());
+        assert!(sign_buy_now(&sample_inputs(f64::NAN, 50), &domain, TEST_PK).is_err());
+        // bad price
+        assert!(sign_buy_now(&sample_inputs(5.0, 0), &domain, TEST_PK).is_err());
+        assert!(sign_buy_now(&sample_inputs(5.0, 100), &domain, TEST_PK).is_err());
+    }
+
+    #[test]
+    fn sign_buy_now_amounts_match_pool_path() {
+        // The Kelly path and the pool path must produce identical amounts
+        // for the same (bet, price) — i.e., they share the same math.
+        let inputs = sample_inputs(5.0, 33);
+        let sn = build_buy_order_inner(&inputs).unwrap();
+        let pp = build_buy_order(&sample_params(), 33).unwrap();   // params.bet_dollars = 5.0
+        assert_eq!(sn.maker_amount, pp.maker_amount);
+        assert_eq!(sn.taker_amount, pp.taker_amount);
     }
 
     #[test]

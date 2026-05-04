@@ -207,10 +207,21 @@ async fn main() -> anyhow::Result<()> {
                     max_bet_dollars:         c.max_bet_dollars,
                 };
                 let runner_cfg = execution::runner::RunnerConfig::default();
+                // G5: SigningParams replaces the pool. Built once, cloned
+                // per-task by the runner. Kelly bet is honored exactly.
+                let signing = Arc::new(execution::executor::SigningParams {
+                    domain:          execution::orders::Domain::polymarket_polygon(),
+                    private_key_hex: c.polymarket_private_key.clone(),
+                    signature_type:  c.polymarket_signature_type,
+                    funder_address:  c.polymarket_funder_address.clone(),
+                    nonce:           0,
+                    fee_rate_bps:    0,
+                    taker:           [0u8; 20],
+                });
                 tasks.spawn(execution::runner::execution_runner_loop(
                     state.clone(),
                     markets.clone(),
-                    order_pool.clone(),
+                    signing,
                     risk_limits.clone(),
                     risk_cfg,
                     sig_cfg,
