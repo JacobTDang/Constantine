@@ -40,5 +40,9 @@ Thumbs.db
 
 # Secrets
 .env
+.env.example
 *.pem
 *.key
+
+# Internal planning docs — not for public repo
+PHASES.md
