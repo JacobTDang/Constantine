@@ -11,15 +11,20 @@
 // signal→submit latency budget reserved for HTTP only. Pre-signing 31 orders
 // up-front is a fixed ~15 ms cost paid at window open.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use dashmap::DashMap;
+use rayon::prelude::*;
+use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::Decimal;
 
 use crate::execution::orders::{
-    sign_order, u256_from_u64, Domain, Order, Side, SignatureType, SignedOrder,
+    sign_order, u256_from_u128, u256_from_u64, Domain, Order, Side, SignatureType, SignedOrder,
 };
 
 // Polymarket / Polygon: USDC and CTF tokens both use 6 decimals.
-const TOKEN_DECIMALS_FACTOR: f64 = 1_000_000.0;
+// LOT_SIZE_SCALE matches rs-clob-client — share count truncates to 0.01 precision.
+const USDC_DECIMALS:    u32 = 6;
+const LOT_SIZE_SCALE:   u32 = 2;
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub struct PoolKey {
@@ -54,6 +59,10 @@ impl OrderPool {
 
     /// Pre-sign BUY orders at every 1-cent tick from `min_cents..=max_cents`.
     /// Returns the count of orders signed.
+    ///
+    /// **Parallel:** uses rayon to fan out ECDSA signing across the global
+    /// thread pool. On a 20-core box, signing 31 orders drops from ~15ms
+    /// sequential to ~2ms.
     pub fn populate_buy_range(
         &self,
         domain:          &Domain,
@@ -72,14 +81,22 @@ impl OrderPool {
             bail!("invalid bet_dollars: {}", params.bet_dollars);
         }
 
-        let mut count = 0;
-        for c in min_cents..=max_cents {
-            let order  = build_buy_order(params, c)?;
-            let signed = sign_order(order, domain, private_key_hex)
-                .with_context(|| format!("sign_order failed at {}c", c))?;
-            let key = PoolKey { asset_id: params.asset_id, side: Side::Buy, price_cents: c };
-            self.inner.insert(key, signed);
-            count += 1;
+        // Parallel ECDSA signing — each tick is independent.
+        // Fail-fast: collect into Result<Vec<_>>, return first Err.
+        let signed: Vec<(PoolKey, SignedOrder)> = (min_cents..=max_cents)
+            .into_par_iter()
+            .map(|c| -> Result<(PoolKey, SignedOrder)> {
+                let order  = build_buy_order(params, c)?;
+                let signed = sign_order(order, domain, private_key_hex)
+                    .with_context(|| format!("sign_order failed at {}c", c))?;
+                let key = PoolKey { asset_id: params.asset_id, side: Side::Buy, price_cents: c };
+                Ok((key, signed))
+            })
+            .collect::<Result<_>>()?;
+
+        let count = signed.len();
+        for (k, v) in signed {
+            self.inner.insert(k, v);
         }
         Ok(count)
     }
@@ -145,19 +162,53 @@ fn random_salt() -> [u8; 32] {
 }
 
 /// Build a BUY order at a given 1¢ price tick, sized to `bet_dollars`.
-/// maker_amount = USDC offered (6 decimals), taker_amount = tokens bought (6 decimals).
+///
+/// Uses `rust_decimal::Decimal` (not f64) so the maker_amount/taker_amount
+/// ratio matches a tick exactly. Mirrors rs-clob-client::OrderBuilder math:
+///
+///   size_shares    = trunc(bet_dollars / price, scale=LOT_SIZE_SCALE=2)
+///   maker_amount   = trunc(size_shares * price, scale=USDC_DECIMALS+LOT_SIZE_SCALE=8)
+///   maker_micros   = floor(maker_amount * 10^USDC_DECIMALS)
+///   taker_micros   = floor(size_shares * 10^USDC_DECIMALS)
+///
+/// `maker_amount_micros` may be slightly less than `bet_dollars` for non-
+/// divisible prices — that's correct: tick alignment beats hitting exactly
+/// the kelly-suggested dollar amount.
 fn build_buy_order(params: &PopulateParams, price_cents: u8) -> Result<Order> {
     if !(1..=99).contains(&price_cents) {
         bail!("price_cents must be in 1..=99, got {}", price_cents);
     }
-    let price = price_cents as f64 / 100.0;
-
-    let usdc_micro  = (params.bet_dollars * TOKEN_DECIMALS_FACTOR).round() as u64;
-    if usdc_micro == 0 {
-        bail!("bet too small to encode in USDC micros: {}", params.bet_dollars);
+    if !params.bet_dollars.is_finite() || params.bet_dollars <= 0.0 {
+        bail!("invalid bet_dollars: {}", params.bet_dollars);
     }
-    let shares      = params.bet_dollars / price;
-    let token_micro = (shares * TOKEN_DECIMALS_FACTOR).round() as u64;
+
+    // Convert bet_dollars to Decimal via cents-int — kelly_size always returns
+    // a 2-decimal value, so this is exact. Avoids f64 → Decimal drift.
+    let bet_cents = (params.bet_dollars * 100.0).round() as i64;
+    if bet_cents <= 0 {
+        bail!("bet too small after rounding to cents: {}", params.bet_dollars);
+    }
+    let bet_usd = Decimal::new(bet_cents, 2);                    // e.g. 5.00
+    let price   = Decimal::new(price_cents as i64, 2);            // e.g. 0.45
+
+    // size_shares = bet / price, truncated to 2 decimal places (LOT_SIZE_SCALE)
+    let size = (bet_usd / price).trunc_with_scale(LOT_SIZE_SCALE);
+    if size.is_zero() {
+        bail!(
+            "size truncates to zero: bet ${} at {}c too small",
+            params.bet_dollars, price_cents,
+        );
+    }
+
+    // maker_amount = size * price, truncated to 8 decimal places
+    let maker_amount = (size * price).trunc_with_scale(USDC_DECIMALS + LOT_SIZE_SCALE);
+
+    // Convert to fixed-point u128 micros (10^USDC_DECIMALS)
+    let maker_micros = decimal_to_micros(maker_amount)?;
+    let taker_micros = decimal_to_micros(size)?;
+    if maker_micros == 0 {
+        bail!("maker_micros is zero after rounding: bet ${}", params.bet_dollars);
+    }
 
     Ok(Order {
         salt:           random_salt(),
@@ -165,14 +216,26 @@ fn build_buy_order(params: &PopulateParams, price_cents: u8) -> Result<Order> {
         signer:         params.signer,
         taker:          params.taker,
         token_id:       params.asset_id,
-        maker_amount:   u256_from_u64(usdc_micro),
-        taker_amount:   u256_from_u64(token_micro),
+        maker_amount:   u256_from_u128(maker_micros),
+        taker_amount:   u256_from_u128(taker_micros),
         expiration:     u256_from_u64(params.expiration_unix),
         nonce:          u256_from_u64(params.nonce),
         fee_rate_bps:   u256_from_u64(params.fee_rate_bps),
         side:           Side::Buy,
         signature_type: params.signature_type,
     })
+}
+
+/// Convert a non-negative Decimal to fixed-point u128 micros (10^USDC_DECIMALS).
+fn decimal_to_micros(d: Decimal) -> Result<u128> {
+    if d.is_sign_negative() {
+        bail!("decimal cannot be negative for USDC micros: {}", d);
+    }
+    let scale_factor = Decimal::from(1_000_000_u64);
+    let scaled       = d * scale_factor;
+    let truncated    = scaled.trunc();
+    truncated.to_u128()
+        .ok_or_else(|| anyhow!("decimal does not fit in u128: {}", d))
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -363,10 +426,14 @@ mod tests {
 
         let a = pool.get(&PoolKey { asset_id: params.asset_id, side: Side::Buy, price_cents: 25 }).unwrap();
         let b = pool.get(&PoolKey { asset_id: params.asset_id, side: Side::Buy, price_cents: 75 }).unwrap();
-        // maker (USDC) is the same — fixed bet size
-        assert_eq!(a.order.maker_amount, b.order.maker_amount);
         // taker (tokens) differs — same dollars buys more shares at 25¢ than 75¢
         assert_ne!(a.order.taker_amount, b.order.taker_amount);
+        // Both maker_amounts are within a few cents of $5 (tick-aligned math
+        // produces slightly less than the requested bet for non-divisible prices)
+        let a_micros = u256_to_dec(&a.order.maker_amount).parse::<u128>().unwrap();
+        let b_micros = u256_to_dec(&b.order.maker_amount).parse::<u128>().unwrap();
+        assert!((4_900_000..=5_000_000).contains(&a_micros), "got {}", a_micros);
+        assert!((4_900_000..=5_000_000).contains(&b_micros), "got {}", b_micros);
     }
 
     #[test]
@@ -388,16 +455,42 @@ mod tests {
 
     #[test]
     fn buy_order_amounts_match_dollar_per_share_math() {
-        // $5 buy at 50¢ should give 10_000_000 token-micros (10 shares)
+        // $5 buy at 50¢ → 10 shares, $5 spent (exact tick — divisible)
         let params = sample_params();
         let order = build_buy_order(&params, 50).unwrap();
         assert_eq!(u256_to_dec(&order.maker_amount), "5000000");
         assert_eq!(u256_to_dec(&order.taker_amount), "10000000");
 
-        // $5 at 25¢ → 20 shares
+        // $5 at 25¢ → 20 shares, $5 spent (exact)
         let order = build_buy_order(&params, 25).unwrap();
         assert_eq!(u256_to_dec(&order.maker_amount), "5000000");
         assert_eq!(u256_to_dec(&order.taker_amount), "20000000");
+    }
+
+    #[test]
+    fn buy_order_amounts_tick_aligned_for_non_divisible_price() {
+        // $5 at 33¢: 5 / 0.33 = 15.151515... → trunc to 15.15 shares
+        // maker_amount = 15.15 * 0.33 = 4.9995 USDC
+        // maker_micros = 4999500, taker_micros = 15150000
+        // Crucially: maker / taker = 4999500 / 15150000 = 0.33 EXACTLY,
+        // which means the contract's price tick check passes.
+        let params = sample_params();
+        let order = build_buy_order(&params, 33).unwrap();
+        assert_eq!(u256_to_dec(&order.maker_amount), "4999500");
+        assert_eq!(u256_to_dec(&order.taker_amount), "15150000");
+        // Ratio sanity: 4999500 * 100 == 15150000 * 33
+        assert_eq!(4_999_500_u128 * 100, 15_150_000_u128 * 33);
+    }
+
+    #[test]
+    fn buy_order_at_67c_also_tick_aligned() {
+        // 5 / 0.67 = 7.4626... → 7.46 shares
+        // 7.46 * 0.67 = 4.9982 USDC
+        let params = sample_params();
+        let order = build_buy_order(&params, 67).unwrap();
+        assert_eq!(u256_to_dec(&order.maker_amount), "4998200");
+        assert_eq!(u256_to_dec(&order.taker_amount), "7460000");
+        assert_eq!(4_998_200_u128 * 100, 7_460_000_u128 * 67);
     }
 
     #[test]
@@ -407,7 +500,51 @@ mod tests {
         assert!(build_buy_order(&params, 100).is_err());
     }
 
+    #[test]
+    fn build_buy_rejects_bet_too_small_for_tick() {
+        // $0.001 bet at 99¢ → size = 0.001/0.99 → trunc(0.00..., 2) = 0
+        let mut params = sample_params();
+        params.bet_dollars = 0.001;
+        // 0.001 * 100 = 0.1 → rounds to 0 cents → rejected at the cent check
+        assert!(build_buy_order(&params, 99).is_err());
+    }
+
     // ── Concurrent access (DashMap should handle) ─────────────────────────
+
+    #[test]
+    fn parallel_populate_beats_sequential_signing() {
+        // Compare populate (rayon-parallel) vs single-thread reference.
+        // Asserts a measurable speedup rather than an absolute deadline,
+        // so the test is portable across slow/fast CI boxes and debug/release.
+        let domain = Domain::polymarket_polygon();
+        let params = sample_params();
+
+        // Warm rayon's global pool — first call has init overhead.
+        OrderPool::new().populate_buy_range(&domain, &params, TEST_PK, 1, 4).unwrap();
+
+        // Sequential reference
+        let start_seq = std::time::Instant::now();
+        for c in 1u8..=99 {
+            let order = build_buy_order(&params, c).unwrap();
+            let _ = sign_order(order, &domain, TEST_PK).unwrap();
+        }
+        let seq = start_seq.elapsed();
+
+        // Parallel via populate
+        let pool = OrderPool::new();
+        let start_par = std::time::Instant::now();
+        pool.populate_buy_range(&domain, &params, TEST_PK, 1, 99).unwrap();
+        let par = start_par.elapsed();
+
+        assert_eq!(pool.len(), 99);
+        // On any multi-core box, parallel should beat sequential by at least 1.5x
+        // (we only need a rough sanity check that rayon is engaged).
+        assert!(
+            par.as_micros() * 3 < seq.as_micros() * 2,
+            "parallel ({}us) should be < 2/3 of sequential ({}us)",
+            par.as_micros(), seq.as_micros(),
+        );
+    }
 
     #[test]
     fn concurrent_take_is_atomic() {

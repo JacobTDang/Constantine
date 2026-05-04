@@ -260,6 +260,10 @@ pub struct WindowSetup<'a> {
     pub fee_rate_bps:     u64,
     pub signature_type:   SignatureType,
     pub private_key_hex:  String,
+    /// Optional override for the order's `maker` field. Required for
+    /// PolyProxy / PolyGnosis signature types (set to the proxy/safe address).
+    /// For EOA leave None — we'll derive maker = signer from the private key.
+    pub funder_address:   Option<String>,
 }
 
 /// Counts of orders signed for each side.
@@ -267,6 +271,43 @@ pub struct WindowSetup<'a> {
 pub struct WindowPoolCounts {
     pub yes_count: usize,
     pub no_count:  usize,
+}
+
+impl<'a> WindowSetup<'a> {
+    /// Construct a setup for a freshly-opened window. Expiration is bound
+    /// to the market's close time so an unfilled order CANNOT carry over
+    /// into a later window.
+    ///
+    /// `funder_address` should be:
+    ///   - None for `signature_type = Eoa` (caller's address derived from key)
+    ///   - Some(proxy_addr) for PolyProxy / PolyGnosis
+    pub fn for_market(
+        market:           &'a PolyMarket,
+        midpoint_yes:     f64,
+        midpoint_no:      f64,
+        bet_dollars:      f64,
+        depth:            u8,
+        nonce:            u64,
+        fee_rate_bps:     u64,
+        signature_type:   crate::execution::orders::SignatureType,
+        private_key_hex:  String,
+        funder_address:   Option<String>,
+    ) -> Self {
+        Self {
+            market,
+            midpoint_yes,
+            midpoint_no,
+            bet_dollars,
+            // Window-bound: orders expire when the window resolves.
+            expiration_unix: market.close_time_ms / 1000,
+            depth,
+            nonce,
+            fee_rate_bps,
+            signature_type,
+            private_key_hex,
+            funder_address,
+        }
+    }
 }
 
 /// Pre-sign BUY ladders for both YES and NO tokens of a single BTC window.
@@ -280,8 +321,18 @@ pub fn populate_pool_for_window(
     let domain = Domain::polymarket_polygon();
     let signer = private_key_to_address(&setup.private_key_hex)
         .context("derive signer address from private key")?;
-    // EOA: maker = signer. PolyProxy / PolyGnosis would diverge — Sprint 9.
-    let maker = signer;
+    // For EOA: maker = signer.
+    // For PolyProxy / PolyGnosis: maker = the proxy/safe address (different
+    // from the EOA that signs).
+    let maker = match (setup.signature_type, setup.funder_address.as_deref()) {
+        (SignatureType::Eoa, _)        => signer,
+        (_, Some(addr))                => crate::execution::orders::hex_to_address(addr)
+            .context("parse funder address")?,
+        (sig, None) => anyhow::bail!(
+            "signature_type {:?} requires a funder_address",
+            sig
+        ),
+    };
 
     let yes_asset = u256_from_dec(&setup.market.up_token_id)
         .context("parse up_token_id")?;
@@ -705,6 +756,7 @@ mod tests {
             fee_rate_bps:    0,
             signature_type:  SignatureType::Eoa,
             private_key_hex: TEST_PK.to_string(),
+            funder_address:  None,
         }
     }
 
@@ -761,6 +813,50 @@ mod tests {
         market.up_token_id = "not-a-decimal".to_string();
         let setup = sample_setup(&market);
         assert!(populate_pool_for_window(&pool, &setup).is_err());
+    }
+
+    #[test]
+    fn for_market_sets_expiration_to_close_time_secs() {
+        let market = sample_market();
+        let setup = WindowSetup::for_market(
+            &market, 0.45, 0.55, 5.0, 15, 0, 0,
+            SignatureType::Eoa, TEST_PK.to_string(), None,
+        );
+        // close_time_ms 2_000_000_000_000 → 2_000_000_000 secs
+        assert_eq!(setup.expiration_unix, 2_000_000_000);
+    }
+
+    #[test]
+    fn populate_pool_uses_funder_for_polyproxy() {
+        let pool = OrderPool::new();
+        let market = sample_market();
+        let funder_hex = "0x1111111111111111111111111111111111111111";
+        let mut setup = sample_setup(&market);
+        setup.signature_type = SignatureType::PolyProxy;
+        setup.funder_address = Some(funder_hex.to_string());
+
+        populate_pool_for_window(&pool, &setup).unwrap();
+
+        // Pull any order out and confirm maker = funder, signer = derived from PK
+        let asset = crate::execution::orders::u256_from_dec(UP_TOKEN_ID).unwrap();
+        let key = PoolKey { asset_id: asset, side: Side::Buy, price_cents: 45 };
+        let signed = pool.get(&key).unwrap();
+        let expected_funder = crate::execution::orders::hex_to_address(funder_hex).unwrap();
+        let expected_signer = crate::execution::orders::private_key_to_address(TEST_PK).unwrap();
+        assert_eq!(signed.order.maker,  expected_funder);
+        assert_eq!(signed.order.signer, expected_signer);
+        assert_ne!(signed.order.maker,  signed.order.signer);
+    }
+
+    #[test]
+    fn populate_pool_polyproxy_without_funder_is_rejected() {
+        let pool = OrderPool::new();
+        let market = sample_market();
+        let mut setup = sample_setup(&market);
+        setup.signature_type = SignatureType::PolyProxy;
+        // funder_address stays None → must error
+        assert!(populate_pool_for_window(&pool, &setup).is_err());
+        assert!(pool.is_empty());
     }
 
     #[test]

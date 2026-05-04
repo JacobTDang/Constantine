@@ -1,0 +1,76 @@
+{
+  "holdout_n": 4029,
+  "holdout_brier": 0.23887198781521451,
+  "holdout_ece": 0.020085677099037833,
+  "holdout_log_loss": 0.6705526810683329,
+  "feature_importance": {
+    "ret_1m": 2124.5307941436768,
+    "ret_3m": 1401.641004562378,
+    "ret_5m": 2293.573902130127,
+    "vol_5m": 3403.747510910034,
+    "vol_30m": 2382.7646980285645,
+    "vol_ratio": 1372.7536029815674,
+    "vol_z_score": 909.3943023681641,
+    "rsi_14": 3021.789014816284,
+    "bb_position": 1295.7341041564941,
+    "macd_signal": 2858.815496444702,
+    "autocorr_lag1": 1555.683795928955,
+    "hour_of_day": 2138.808204650879,
+    "day_of_week": 534.2699012756348
+  },
+  "alpha_results": [
+    {
+      "alpha": 0.0,
+      "n_trades": 46,
+      "total_pnl": -1365.4237070814786,
+      "final_bankroll": 134.57629291852228,
+      "return_pct": -91.02824713876518,
+      "sharpe_annual": -365.06441049373717,
+      "max_drawdown": 0.9084178589968271,
+      "win_rate": 0.0,
+      "avg_edge": 0.4727207867828829,
+      "days_killed": 14,
+      "passed_criteria": false
+    },
+    {
+      "alpha": 0.3,
+      "n_trades": 46,
+      "total_pnl": -1335.997461364518,
+      "final_bankroll": 164.00253863548312,
+      "return_pct": -89.06649742430113,
+      "sharpe_annual": -279.5265461902911,
+      "max_drawdown": 0.8883926485678528,
+      "win_rate": 0.0,
+      "avg_edge": 0.3434327653048533,
+      "days_killed": 14,
+      "passed_criteria": false
+    },
+    {
+      "alpha": 0.6,
+      "n_trades": 51,
+      "total_pnl": -1325.610672494614,
+      "final_bankroll": 174.38932750538686,
+      "return_pct": -88.3740448329742,
+      "sharpe_annual": -127.52042283972993,
+      "max_drawdown": 0.8813242092296582,
+      "win_rate": 0.0,
+      "avg_edge": 0.19486910055645668,
+      "days_killed": 14,
+      "passed_criteria": false
+    },
+    {
+      "alpha": 1.0,
+      "n_trades": 104,
+      "total_pnl": 294.74984105010657,
+      "final_bankroll": 1794.7498410501078,
+      "return_pct": 19.649989403340506,
+      "sharpe_annual": 4.888976109702379,
+      "max_drawdown": 0.10629749062156743,
+      "win_rate": 0.5673076923076923,
+      "avg_edge": 0.075735292496462,
+      "days_killed": 14,
+      "passed_criteria": false
+    }
+  ],
+  "overall_passed": false
+}

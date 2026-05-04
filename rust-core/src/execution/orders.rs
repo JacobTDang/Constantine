@@ -85,6 +85,21 @@ pub enum SignatureType {
     PolyGnosis  = 2,
 }
 
+impl SignatureType {
+    /// Parse from the canonical name (matches Polymarket's docs):
+    /// "EOA" / "POLY_PROXY" / "POLY_GNOSIS_SAFE", case-insensitive.
+    pub fn parse(s: &str) -> anyhow::Result<Self> {
+        match s.to_ascii_uppercase().as_str() {
+            "EOA" | "0"               => Ok(Self::Eoa),
+            "POLY_PROXY" | "PROXY" | "1" => Ok(Self::PolyProxy),
+            "POLY_GNOSIS_SAFE" | "GNOSIS" | "2" => Ok(Self::PolyGnosis),
+            other => anyhow::bail!(
+                "unknown signature type: {other:?} (expected EOA / POLY_PROXY / POLY_GNOSIS_SAFE)"
+            ),
+        }
+    }
+}
+
 /// Order fields exactly matching the on-chain struct schema.
 /// All `[u8; 32]` fields are big-endian 256-bit integers.
 #[derive(Debug, Clone)]
@@ -473,6 +488,20 @@ mod tests {
     fn side_as_str_matches_clob_wire_format() {
         assert_eq!(Side::Buy.as_str(),  "BUY");
         assert_eq!(Side::Sell.as_str(), "SELL");
+    }
+
+    #[test]
+    fn signature_type_parse_accepts_canonical_and_aliases() {
+        assert_eq!(SignatureType::parse("EOA").unwrap(),               SignatureType::Eoa);
+        assert_eq!(SignatureType::parse("eoa").unwrap(),               SignatureType::Eoa);
+        assert_eq!(SignatureType::parse("0").unwrap(),                 SignatureType::Eoa);
+        assert_eq!(SignatureType::parse("POLY_PROXY").unwrap(),        SignatureType::PolyProxy);
+        assert_eq!(SignatureType::parse("proxy").unwrap(),             SignatureType::PolyProxy);
+        assert_eq!(SignatureType::parse("1").unwrap(),                 SignatureType::PolyProxy);
+        assert_eq!(SignatureType::parse("POLY_GNOSIS_SAFE").unwrap(),  SignatureType::PolyGnosis);
+        assert_eq!(SignatureType::parse("gnosis").unwrap(),            SignatureType::PolyGnosis);
+        assert_eq!(SignatureType::parse("2").unwrap(),                 SignatureType::PolyGnosis);
+        assert!(SignatureType::parse("XYZ").is_err());
     }
 
     // ── Keccak256 ─────────────────────────────────────────────────────────

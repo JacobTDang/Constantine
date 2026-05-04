@@ -14,7 +14,10 @@
 // which reads both files and joins on market_id. The live process only
 // appends — it doesn't have to update past records.
 
+pub mod positions;
 pub mod settlement;
+
+pub use positions::{Position, PositionEvent, PositionStatus, PositionStore, SettleOutcome};
 
 use std::fs::OpenOptions;
 use std::io::Write;

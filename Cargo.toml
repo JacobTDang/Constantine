@@ -25,6 +25,7 @@ chrono            = { version = "0.4",  features = ["serde"] }
 rust_decimal      = { version = "1",    features = ["serde-with-str"] }
 uuid              = { version = "1",    features = ["v4"] }
 memmap2           = "0.9"
+rayon             = "1.10"
 
 # Pure-Rust crypto for EIP-712 signing + L2 auth headers (no gcc needed)
 k256              = { version = "0.13", features = ["ecdsa", "sha2"] }

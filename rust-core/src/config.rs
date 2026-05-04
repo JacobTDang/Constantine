@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
 
+use crate::execution::orders::SignatureType;
+
 #[derive(Debug, Clone)]
 pub struct Config {
     // Polymarket credentials
@@ -7,6 +9,14 @@ pub struct Config {
     pub polymarket_api_key: String,
     pub polymarket_api_secret: String,
     pub polymarket_api_passphrase: String,
+    /// Signing model — "EOA" / "POLY_PROXY" / "POLY_GNOSIS_SAFE".
+    /// EOA: maker = signer = derived from private_key.
+    /// POLY_PROXY / POLY_GNOSIS_SAFE: maker = funder_address, signer = derived from private_key.
+    pub polymarket_signature_type: SignatureType,
+    /// Optional override for the order's `maker` field. Required when
+    /// signature_type is POLY_PROXY or POLY_GNOSIS_SAFE (must be the proxy /
+    /// safe address). For EOA, leave None and we derive from the private key.
+    pub polymarket_funder_address: Option<String>,
 
     // RPC
     pub alchemy_polygon_key: String,
@@ -70,11 +80,29 @@ impl Config {
             }
         };
 
+        let sig_type = match get("POLYMARKET_SIGNATURE_TYPE") {
+            Some(s) => SignatureType::parse(&s)?,
+            None    => SignatureType::Eoa,
+        };
+        let funder = get("POLYMARKET_FUNDER_ADDRESS").filter(|s| !s.is_empty());
+
+        // POLY_PROXY / POLY_GNOSIS_SAFE require an explicit funder address.
+        if matches!(sig_type, SignatureType::PolyProxy | SignatureType::PolyGnosis)
+            && funder.is_none()
+        {
+            anyhow::bail!(
+                "POLYMARKET_SIGNATURE_TYPE={:?} requires POLYMARKET_FUNDER_ADDRESS to be set",
+                sig_type
+            );
+        }
+
         Ok(Self {
-            polymarket_private_key:   req("POLYMARKET_PRIVATE_KEY")?,
-            polymarket_api_key:       req("POLYMARKET_API_KEY")?,
-            polymarket_api_secret:    req("POLYMARKET_API_SECRET")?,
-            polymarket_api_passphrase:req("POLYMARKET_API_PASSPHRASE")?,
+            polymarket_private_key:    req("POLYMARKET_PRIVATE_KEY")?,
+            polymarket_api_key:        req("POLYMARKET_API_KEY")?,
+            polymarket_api_secret:     req("POLYMARKET_API_SECRET")?,
+            polymarket_api_passphrase: req("POLYMARKET_API_PASSPHRASE")?,
+            polymarket_signature_type: sig_type,
+            polymarket_funder_address: funder,
             alchemy_polygon_key:      req("ALCHEMY_POLYGON_KEY")?,
             anthropic_api_key:        get("ANTHROPIC_API_KEY"),
             dry_run:                  bool_var("DRY_RUN", true)?,
@@ -135,6 +163,9 @@ mod tests {
         assert_eq!(cfg.polymarket_api_key,        "test-api-key");
         assert_eq!(cfg.polymarket_api_secret,     "test-api-secret");
         assert_eq!(cfg.polymarket_api_passphrase, "test-passphrase");
+        // Default signature type is EOA, no funder needed
+        assert_eq!(cfg.polymarket_signature_type, SignatureType::Eoa);
+        assert!(cfg.polymarket_funder_address.is_none());
         assert_eq!(cfg.alchemy_polygon_key,       "test-alchemy-key");
         assert_eq!(cfg.anthropic_api_key.as_deref(), Some("test-anthropic-key"));
         assert!(cfg.dry_run);
@@ -198,5 +229,39 @@ mod tests {
         let mut env = fixture();
         env.insert("DRY_RUN".to_string(), "false".to_string());
         assert!(!parse(&env).unwrap().dry_run);
+    }
+
+    #[test]
+    fn poly_proxy_sigtype_parses_with_funder() {
+        let mut env = fixture();
+        env.insert("POLYMARKET_SIGNATURE_TYPE".into(), "POLY_PROXY".into());
+        env.insert("POLYMARKET_FUNDER_ADDRESS".into(), "0xabc".into());
+        let cfg = parse(&env).unwrap();
+        assert_eq!(cfg.polymarket_signature_type, SignatureType::PolyProxy);
+        assert_eq!(cfg.polymarket_funder_address.as_deref(), Some("0xabc"));
+    }
+
+    #[test]
+    fn poly_proxy_sigtype_without_funder_is_rejected() {
+        let mut env = fixture();
+        env.insert("POLYMARKET_SIGNATURE_TYPE".into(), "POLY_PROXY".into());
+        // No POLYMARKET_FUNDER_ADDRESS — should fail
+        let err = parse(&env).unwrap_err().to_string();
+        assert!(err.contains("POLYMARKET_FUNDER_ADDRESS"), "error was: {err}");
+    }
+
+    #[test]
+    fn invalid_sigtype_is_rejected() {
+        let mut env = fixture();
+        env.insert("POLYMARKET_SIGNATURE_TYPE".into(), "WAT".into());
+        assert!(parse(&env).is_err());
+    }
+
+    #[test]
+    fn empty_funder_address_treated_as_unset() {
+        let mut env = fixture();
+        env.insert("POLYMARKET_FUNDER_ADDRESS".into(), "".into());
+        let cfg = parse(&env).unwrap();
+        assert!(cfg.polymarket_funder_address.is_none());
     }
 }
