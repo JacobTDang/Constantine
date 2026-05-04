@@ -83,8 +83,9 @@ pub struct FeatureState {
     pub chainlink_price:   f64,
     pub spot_price:        f64, // latest OKX spot trade price
     pub mark_price:        f64, // latest OKX perp mark price
-    pub poly_yes_price:    f64,
-    pub window_open_price: f64, // strike fetched from Gamma API (D1)
+    pub poly_yes_price:    f64, // up_book.best_ask (cost to buy YES)
+    pub poly_no_price:     f64, // down_book.best_ask (cost to buy NO) — internal, not in feature vec
+    pub window_open_price: f64, // strike — chainlink price captured at window open
 
     // Sequence counter — incremented every 500ms tick, read by Python IPC
     pub seq: u64,
@@ -137,6 +138,7 @@ impl Default for FeatureState {
             spot_price:        0.0,
             mark_price:        0.0,
             poly_yes_price:    0.5,
+            poly_no_price:     0.5,
             window_open_price: 0.0,
 
             seq: 0,

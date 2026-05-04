@@ -46,7 +46,10 @@ async fn main() -> anyhow::Result<()> {
     tasks.spawn(streams::polymarket::chainlink_polling_loop(tx.clone()));
     tasks.spawn(streams::polymarket::clob_orchestrator(markets.clone(), tx.clone()));
 
-    tracing::info!("all tasks started — streams + features + market discovery + chainlink + clob");
+    // Signal evaluation loop (E5) — every 500ms, picks intramarket > oracle
+    tasks.spawn(signals::signal_loop(state.clone(), signals::SignalConfig::default()));
+
+    tracing::info!("all tasks started — streams + features + market discovery + signal loop");
 
     // Signal, execution, IPC tasks join in later phases.
     tasks.join_all().await;

@@ -225,11 +225,11 @@ fn update_polymarket_features(state: &mut FeatureState, markets: &[PolyMarket], 
     if let (Some(ub), Some(db)) = (up_book, down_book) {
         // We trade YES = "Up", so poly_yes_price is what it costs to buy that
         state.poly_yes_price = ub.best_ask;
+        state.poly_no_price  = db.best_ask;
         state.poly_obi       = compute_obi(ub.best_bid_size, ub.best_ask_size);
         state.spread         = compute_spread(ub.best_bid, ub.best_ask);
         state.arb_gap        = compute_arb_gap(ub.best_ask, db.best_ask);
-        // oracle_gap is computed in E2 using the binary-option fair value;
-        // for now leave it at default until that signal is wired.
+        // oracle_gap is set by the signal evaluator (E5) using fair_value_yes
     }
 }
 
