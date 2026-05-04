@@ -49,7 +49,20 @@ async fn main() -> anyhow::Result<()> {
     // Signal evaluation loop (E5) — every 500ms, picks intramarket > oracle
     tasks.spawn(signals::signal_loop(state.clone(), signals::SignalConfig::default()));
 
-    tracing::info!("all tasks started — streams + features + market discovery + signal loop");
+    // IPC bridge with Python ML layer (G2 + G3)
+    let py_signal: Arc<tokio::sync::RwLock<Option<ipc::PythonSignal>>> =
+        Arc::new(tokio::sync::RwLock::new(None));
+    {
+        let st = state.clone();
+        tasks.spawn(async move {
+            if let Err(e) = ipc::features_writer_loop(st, ipc::default_features_path()).await {
+                tracing::error!(error = %e, "features writer loop crashed");
+            }
+        });
+    }
+    tasks.spawn(ipc::signal_reader_loop(py_signal.clone(), ipc::default_signal_path()));
+
+    tracing::info!("all tasks started — streams + features + signals + IPC bridge");
 
     // Signal, execution, IPC tasks join in later phases.
     tasks.join_all().await;
