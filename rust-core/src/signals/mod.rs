@@ -7,6 +7,7 @@ use tokio::sync::RwLock;
 use tokio::time::{Duration, MissedTickBehavior};
 
 use crate::features::FeatureState;
+use crate::storage::{SignalLog, SignalRow};
 use intramarket::{check_intramarket_arb, IntramarketArbSignal};
 use oracle_arb::{check_oracle_arb, OracleArbSignal};
 use regime::{classify_regime, Regime};
@@ -44,6 +45,12 @@ pub struct SignalConfig {
     pub intramarket_min_profit:     f64,   // Min net profit per share (typ. 0.005)
     pub oracle_arb_threshold:       f64,   // Min edge for oracle arb (typ. 0.04)
     pub min_time_remaining_secs:    f64,   // Skip if window resolves too soon (typ. 5)
+
+    // Sanity gates — protect data quality during observe-only mode and
+    // protect the bankroll once execution is live.
+    pub min_liquidity_usd:          f64,   // Skip thin books (typ. 100)
+    pub max_spread:                 f64,   // Skip broken books (typ. 0.10)
+    pub min_window_age_secs:        f64,   // Skip just-opened windows (typ. 15)
 }
 
 impl Default for SignalConfig {
@@ -53,6 +60,9 @@ impl Default for SignalConfig {
             intramarket_min_profit:  0.005,
             oracle_arb_threshold:    0.04,
             min_time_remaining_secs: 5.0,
+            min_liquidity_usd:       100.0,
+            max_spread:              0.10,
+            min_window_age_secs:     15.0,
         }
     }
 }
@@ -74,6 +84,18 @@ pub fn evaluate_signals(state: &FeatureState, cfg: &SignalConfig) -> SignalDecis
     // Window must be open with enough time left to actually fill
     if state.time_to_close < cfg.min_time_remaining_secs {
         return SignalDecision::None;
+    }
+
+    // Sanity gates — protect data quality and capital
+    if state.spread > cfg.max_spread {
+        return SignalDecision::None; // broken or thin book
+    }
+    if state.primary_yes_liquidity_usd < cfg.min_liquidity_usd
+        || state.primary_no_liquidity_usd  < cfg.min_liquidity_usd {
+        return SignalDecision::None; // not enough depth to fill cleanly
+    }
+    if state.primary_window_age_secs < cfg.min_window_age_secs {
+        return SignalDecision::None; // strike just captured — wait for stable signal
     }
 
     let yes_ask = state.poly_yes_price;
@@ -119,8 +141,13 @@ pub fn current_regime(state: &FeatureState) -> Regime {
 }
 
 /// Async signal loop: evaluates every 500ms, logs whenever a signal fires.
+/// Persists every fired signal to SQLite for observe-only validation.
 /// Execution wiring (J5) reads the same shared state and consumes the signal.
-pub async fn signal_loop(state: Arc<RwLock<FeatureState>>, cfg: SignalConfig) {
+pub async fn signal_loop(
+    state:   Arc<RwLock<FeatureState>>,
+    cfg:     SignalConfig,
+    log_db:  Arc<SignalLog>,
+) {
     let mut tick = tokio::time::interval(Duration::from_millis(500));
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -141,6 +168,9 @@ pub async fn signal_loop(state: Arc<RwLock<FeatureState>>, cfg: SignalConfig) {
                     ?regime,
                     "INTRAMARKET ARB"
                 );
+                if let Err(e) = persist_signal(&log_db, &s, regime, &decision) {
+                    tracing::error!(error = %e, "failed to persist signal to sqlite");
+                }
             }
             SignalDecision::Oracle(sig) => {
                 tracing::info!(
@@ -154,9 +184,77 @@ pub async fn signal_loop(state: Arc<RwLock<FeatureState>>, cfg: SignalConfig) {
                     ?regime,
                     "ORACLE ARB"
                 );
+                if let Err(e) = persist_signal(&log_db, &s, regime, &decision) {
+                    tracing::error!(error = %e, "failed to persist signal to sqlite");
+                }
             }
         }
     }
+}
+
+fn persist_signal(
+    log_db:   &SignalLog,
+    state:    &FeatureState,
+    regime:   Regime,
+    decision: &SignalDecision,
+) -> anyhow::Result<()> {
+    let market_id = state.primary_market_id.clone()
+        .ok_or_else(|| anyhow::anyhow!("no primary market"))?;
+    let now_ms    = chrono::Utc::now().timestamp_millis() as u64;
+    let regime_s = match regime {
+        Regime::LowVolRanging  => "ranging",
+        Regime::LowVolTrending => "trending",
+        Regime::HighVolEvent   => "event",
+    }.to_string();
+
+    let (signal_type, direction, fair_value, edge, confidence, bet) = match decision {
+        SignalDecision::Intramarket(s) => {
+            ("intramarket".to_string(), None, 1.0, s.net_profit, 1.0, kelly_for_intramarket(s))
+        }
+        SignalDecision::Oracle(s) => {
+            let dir = match s.direction {
+                Direction::Up   => Some("up".to_string()),
+                Direction::Down => Some("down".to_string()),
+            };
+            let bet = crate::execution::kelly::kelly_size(
+                s.fair_value, s.market_price, 1500.0, 0.25, 30.0,
+            );
+            ("oracle".to_string(), dir, s.fair_value, s.edge, s.confidence, bet)
+        }
+        SignalDecision::None => return Ok(()),
+    };
+
+    log_db.insert_signal(&SignalRow {
+        fired_at_ms:            now_ms,
+        market_id,
+        signal_type,
+        direction,
+        spot_price:             state.spot_price,
+        chainlink_price:        state.chainlink_price,
+        strike_price:           state.window_open_price,
+        yes_ask:                state.poly_yes_price,
+        no_ask:                 state.poly_no_price,
+        vol_5m:                 state.vol_5m,
+        time_to_close_secs:     state.time_to_close,
+        window_age_secs:        state.primary_window_age_secs,
+        yes_liquidity_usd:      state.primary_yes_liquidity_usd,
+        no_liquidity_usd:       state.primary_no_liquidity_usd,
+        spread:                 state.spread,
+        regime:                 regime_s,
+        fair_value,
+        edge,
+        confidence,
+        would_have_bet_dollars: bet,
+    })?;
+    Ok(())
+}
+
+fn kelly_for_intramarket(s: &IntramarketArbSignal) -> f64 {
+    // For intramarket, we'd buy both sides for a guaranteed payoff.
+    // Practical position sizing: cap at $30 to match max_bet.
+    // This is simplified for the observe-mode log — execution layer (J)
+    // will compute a more nuanced size considering both legs.
+    30.0_f64.min(1500.0 * 0.02 * (s.net_profit * 100.0).clamp(1.0, 10.0))
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -168,17 +266,22 @@ mod tests {
 
     fn calm_state_with_market() -> FeatureState {
         let mut s = FeatureState::default();
-        s.primary_market_id  = Some("test-market".to_string());
-        s.time_to_close      = 60.0;
-        s.spot_price         = 80_000.0;
-        s.window_open_price  = 80_000.0;
-        s.vol_5m             = 0.001;
-        s.vol_30m            = 0.001;
-        s.vol_z_score        = 0.0;
-        s.vol_ratio          = 1.0;
-        s.autocorr_lag1      = 0.0;
-        s.poly_yes_price     = 0.50;
-        s.poly_no_price      = 0.50;
+        s.primary_market_id           = Some("test-market".to_string());
+        s.primary_duration_min        = 5;
+        s.time_to_close               = 60.0;
+        s.spot_price                  = 80_000.0;
+        s.window_open_price           = 80_000.0;
+        s.vol_5m                      = 0.001;
+        s.vol_30m                     = 0.001;
+        s.vol_z_score                 = 0.0;
+        s.vol_ratio                   = 1.0;
+        s.autocorr_lag1               = 0.0;
+        s.poly_yes_price              = 0.50;
+        s.poly_no_price               = 0.50;
+        s.spread                      = 0.02;     // healthy, below max
+        s.primary_yes_liquidity_usd   = 500.0;    // above min
+        s.primary_no_liquidity_usd    = 500.0;
+        s.primary_window_age_secs     = 60.0;     // window has been open 1 min
         s
     }
 

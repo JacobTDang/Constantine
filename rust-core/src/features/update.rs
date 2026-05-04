@@ -186,7 +186,7 @@ fn capture_window_strikes(state: &mut FeatureState, markets: &[PolyMarket], now_
             if now_ms >= open_ms && now_ms < close_ms
                 && !state.window_strikes.contains_key(&m.id)
             {
-                state.window_strikes.insert(m.id.clone(), state.chainlink_price);
+                state.window_strikes.insert(m.id.clone(), (now_ms, state.chainlink_price));
                 tracing::info!(
                     market = %m.id,
                     strike = state.chainlink_price,
@@ -212,11 +212,15 @@ fn update_polymarket_features(state: &mut FeatureState, markets: &[PolyMarket], 
         return;
     };
 
-    state.primary_market_id = Some(m.id.clone());
-    state.time_to_close     = m.time_to_close_secs(now_ms);
+    state.primary_market_id   = Some(m.id.clone());
+    state.primary_duration_min = m.duration_min;
+    state.time_to_close        = m.time_to_close_secs(now_ms);
 
-    if let Some(strike) = state.window_strikes.get(&m.id) {
-        state.window_open_price = *strike;
+    if let Some((capture_ms, strike)) = state.window_strikes.get(&m.id) {
+        state.window_open_price        = *strike;
+        state.primary_window_age_secs  = (now_ms.saturating_sub(*capture_ms)) as f64 / 1000.0;
+    } else {
+        state.primary_window_age_secs  = 0.0;
     }
 
     let up_book   = state.asset_books.get(&m.up_token_id).copied();
@@ -229,6 +233,13 @@ fn update_polymarket_features(state: &mut FeatureState, markets: &[PolyMarket], 
         state.poly_obi       = compute_obi(ub.best_bid_size, ub.best_ask_size);
         state.spread         = compute_spread(ub.best_bid, ub.best_ask);
         state.arb_gap        = compute_arb_gap(ub.best_ask, db.best_ask);
+
+        // Liquidity in dollars: shares × price for each touch. We sum bid + ask
+        // sides on each token — typically you'd absorb a 2-way fill.
+        state.primary_yes_liquidity_usd =
+            ub.best_bid_size * ub.best_bid + ub.best_ask_size * ub.best_ask;
+        state.primary_no_liquidity_usd  =
+            db.best_bid_size * db.best_bid + db.best_ask_size * db.best_ask;
         // oracle_gap is set by the signal evaluator (E5) using fair_value_yes
     }
 }
@@ -584,13 +595,17 @@ mod tests {
         let now_ms = chrono::Utc::now().timestamp_millis() as u64;
         let m = sample_poly_market("m", now_ms + 120_000, 5); // window already open
         capture_window_strikes(&mut s, &[m.clone()], now_ms);
-        assert_eq!(s.window_strikes.get("m").copied(), Some(80_500.0));
+        let captured = s.window_strikes.get("m").copied();
+        assert!(captured.is_some());
+        let (cap_ms, strike) = captured.unwrap();
+        assert!((strike - 80_500.0).abs() < 1e-10);
+        assert_eq!(cap_ms, now_ms);
     }
 
     #[test]
     fn window_strikes_garbage_collected_after_close() {
         let mut s = FeatureState::default();
-        s.window_strikes.insert("expired".to_string(), 80_000.0);
+        s.window_strikes.insert("expired".to_string(), (1_000, 80_000.0));
         let now_ms = chrono::Utc::now().timestamp_millis() as u64;
         // Empty markets list → all strikes are stale
         capture_window_strikes(&mut s, &[], now_ms);

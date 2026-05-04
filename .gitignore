@@ -25,6 +25,7 @@ data/logs/*.log
 data/logs/*.jsonl
 data/db/*.db
 data/db/*.sqlite
+data/db/*.jsonl
 data/raw/
 
 # IDE / tools

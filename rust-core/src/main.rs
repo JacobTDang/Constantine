@@ -5,6 +5,7 @@ mod ipc;
 mod logging;
 mod risk;
 mod signals;
+mod storage;
 mod streams;
 
 use std::sync::Arc;
@@ -46,8 +47,26 @@ async fn main() -> anyhow::Result<()> {
     tasks.spawn(streams::polymarket::chainlink_polling_loop(tx.clone()));
     tasks.spawn(streams::polymarket::clob_orchestrator(markets.clone(), tx.clone()));
 
+    // Observe-mode JSONL logs: every fired signal + settlement outcome
+    // analysed offline via scripts/observe_report.py
+    let signal_log = Arc::new(
+        storage::SignalLog::open(&std::path::PathBuf::from("data/db"))
+            .expect("failed to open signal log dir")
+    );
+
     // Signal evaluation loop (E5) — every 500ms, picks intramarket > oracle
-    tasks.spawn(signals::signal_loop(state.clone(), signals::SignalConfig::default()));
+    tasks.spawn(signals::signal_loop(
+        state.clone(),
+        signals::SignalConfig::default(),
+        signal_log.clone(),
+    ));
+
+    // Settlement monitor — when markets resolve, update pending signals with realized P&L
+    tasks.spawn(storage::settlement::settlement_monitor_loop(
+        markets.clone(),
+        state.clone(),
+        signal_log.clone(),
+    ));
 
     // IPC bridge with Python ML layer (G2 + G3)
     let py_signal: Arc<tokio::sync::RwLock<Option<ipc::PythonSignal>>> =

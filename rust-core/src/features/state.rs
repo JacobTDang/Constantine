@@ -38,8 +38,12 @@ pub struct FeatureState {
 
     // ── Polymarket per-market state (D5/D6) ───────────────────────────────
     pub asset_books:    HashMap<String, BookState>,    // asset_id -> latest book
-    pub window_strikes: HashMap<String, f64>,          // market_id -> chainlink price captured at window open
-    pub primary_market_id: Option<String>,             // currently-selected primary market for feature output
+    pub window_strikes: HashMap<String, (u64, f64)>,   // market_id -> (capture_ms, strike)
+    pub primary_market_id:        Option<String>,
+    pub primary_yes_liquidity_usd: f64,                // best_bid_size*price + best_ask_size*price
+    pub primary_no_liquidity_usd:  f64,
+    pub primary_window_age_secs:   f64,                // seconds since strike captured (0 if no strike)
+    pub primary_duration_min:      u32,                // 5 or 15 — derived from primary market
 
     // ── Feature vector — 26 fields, written to IPC every 500ms ───────────
 
@@ -100,9 +104,13 @@ impl Default for FeatureState {
             oi_history:  VecDeque::with_capacity(OI_HIST),
             liq_history: VecDeque::with_capacity(LIQ_HIST),
 
-            asset_books:        HashMap::new(),
-            window_strikes:     HashMap::new(),
-            primary_market_id:  None,
+            asset_books:                  HashMap::new(),
+            window_strikes:               HashMap::new(),
+            primary_market_id:            None,
+            primary_yes_liquidity_usd:    0.0,
+            primary_no_liquidity_usd:     0.0,
+            primary_window_age_secs:      0.0,
+            primary_duration_min:         0,
 
             ret_1m: 0.0,
             ret_3m: 0.0,
