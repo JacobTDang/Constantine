@@ -59,13 +59,23 @@ impl Domain {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Side {
     Buy  = 0,
     Sell = 1,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+impl Side {
+    /// Wire format for the CLOB REST API.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Side::Buy  => "BUY",
+            Side::Sell => "SELL",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SignatureType {
     /// Standard externally-owned account
     Eoa         = 0,
@@ -271,6 +281,41 @@ pub fn parse_private_key(s: &str) -> Result<[u8; 32]> {
     Ok(out)
 }
 
+/// Big-endian 256-bit encoding of a u64 (right-aligned in the 32-byte word).
+pub fn u256_from_u64(v: u64) -> [u8; 32] {
+    let mut buf = [0u8; 32];
+    buf[24..].copy_from_slice(&v.to_be_bytes());
+    buf
+}
+
+/// Big-endian 256-bit encoding of a u128 (right-aligned in the 32-byte word).
+pub fn u256_from_u128(v: u128) -> [u8; 32] {
+    let mut buf = [0u8; 32];
+    buf[16..].copy_from_slice(&v.to_be_bytes());
+    buf
+}
+
+/// Convert a 32-byte big-endian uint256 to its decimal string (no leading zeros).
+/// The CLOB REST API expects amounts and tokenIds as decimal strings.
+pub fn u256_to_dec(b: &[u8; 32]) -> String {
+    if b.iter().all(|&x| x == 0) {
+        return "0".to_string();
+    }
+    let mut v = *b;
+    let mut digits = Vec::new();
+    while !v.iter().all(|&x| x == 0) {
+        let mut rem: u32 = 0;
+        for byte in v.iter_mut() {
+            let cur = rem * 256 + *byte as u32;
+            *byte = (cur / 10) as u8;
+            rem = cur % 10;
+        }
+        digits.push(b'0' + rem as u8);
+    }
+    digits.reverse();
+    String::from_utf8(digits).expect("digits are ascii")
+}
+
 pub fn u256_from_dec(s: &str) -> Result<[u8; 32]> {
     // Decimal string → 32-byte big-endian. We use a simple loop because we
     // don't need a full bignum for the values we encounter in orders.
@@ -393,6 +438,41 @@ mod tests {
     #[test]
     fn u256_rejects_non_digit() {
         assert!(u256_from_dec("123a").is_err());
+    }
+
+    #[test]
+    fn u256_from_u64_round_trips_via_dec() {
+        for v in [0u64, 1, 42, 1_000_000, u64::MAX] {
+            let encoded = u256_from_u64(v);
+            assert_eq!(u256_to_dec(&encoded), v.to_string());
+        }
+    }
+
+    #[test]
+    fn u256_from_u128_handles_large_values() {
+        let v: u128 = 123_456_789_012_345_678_901_234_567_890;
+        let encoded = u256_from_u128(v);
+        assert_eq!(u256_to_dec(&encoded), v.to_string());
+    }
+
+    #[test]
+    fn u256_to_dec_round_trips_with_from_dec() {
+        for s in ["0", "1", "255", "1000000", "1234567890",
+                  "115792089237316195423570985008687907853269984665640564039457584007913129639935"] {
+            let bytes = u256_from_dec(s).unwrap();
+            assert_eq!(u256_to_dec(&bytes), s);
+        }
+    }
+
+    #[test]
+    fn u256_to_dec_zero_is_zero() {
+        assert_eq!(u256_to_dec(&[0u8; 32]), "0");
+    }
+
+    #[test]
+    fn side_as_str_matches_clob_wire_format() {
+        assert_eq!(Side::Buy.as_str(),  "BUY");
+        assert_eq!(Side::Sell.as_str(), "SELL");
     }
 
     // ── Keccak256 ─────────────────────────────────────────────────────────
