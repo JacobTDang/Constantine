@@ -41,31 +41,46 @@ def load_jsonl(path: Path) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+# ── Cost model (paper-trading P&L matches backtest.py) ───────────────────────
+# These mirror scripts/backtest.py::CostModel — keep them in sync.
+FEE_RATE       = 0.018   # Polymarket BTC taker
+ENTRY_SLIPPAGE = 0.010   # 1% — thin Polymarket books typically slip this much
+EXIT_SLIPPAGE  = 0.005   # 0.5% — exit (settlement) generally cleaner
+
+
 def compute_realized_pnl(signal: pd.Series, settlement: pd.Series) -> float:
-    """Hypothetical P&L if we'd executed the signal."""
+    """Hypothetical P&L if we'd executed the signal. Includes fees + slippage.
+
+    Formula:
+        effective_buy_price = price * (1 + entry_slippage) * (1 + fee_rate)
+        shares              = bet / effective_buy_price
+        on_win_payout       = shares * (1 - exit_slippage) * (1 - fee_rate)
+        pnl_win             = on_win_payout - bet
+        pnl_loss            = -bet  (entry fees already lost when we bought)
+    """
     bet = float(signal["would_have_bet_dollars"])
     if signal["signal_type"] == "intramarket":
-        # Risk-free arb: profit = bet * net_profit (edge field stores net)
+        # edge already accounts for fees (computed in compute_intramarket_arb)
         return bet * float(signal["edge"])
 
-    # Oracle arb: paid yes_ask or no_ask, won iff direction matches outcome
-    direction   = signal["direction"]
-    outcome_up  = bool(settlement["outcome_up"])
+    direction  = signal["direction"]
+    outcome_up = bool(settlement["outcome_up"])
+
     if direction == "up":
-        won = outcome_up
-        price = float(signal["yes_ask"])
+        won, price = outcome_up,       float(signal["yes_ask"])
     elif direction == "down":
-        won = not outcome_up
-        price = float(signal["no_ask"])
+        won, price = not outcome_up,   float(signal["no_ask"])
     else:
         return 0.0
 
+    if price <= 0 or price >= 1:
+        return -bet  # malformed input — treat as loss
+
     if won:
-        # Bought `bet/price` shares, each pays out $1 on win → profit = shares × (1 - price)
-        if price <= 0:
-            return -bet
-        shares = bet / price
-        return shares * (1.0 - price)
+        effective_buy_price = price * (1.0 + ENTRY_SLIPPAGE) * (1.0 + FEE_RATE)
+        shares              = bet / effective_buy_price
+        on_win_payout       = shares * 1.0 * (1.0 - EXIT_SLIPPAGE) * (1.0 - FEE_RATE)
+        return on_win_payout - bet
     return -bet
 
 
