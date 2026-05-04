@@ -64,9 +64,13 @@ pub async fn compute_loop(
 // ── History update (O(1) per event) ──────────────────────────────────────────
 
 pub(crate) fn update_history(state: &mut FeatureState, event: StreamEvent) {
+    let now_ms = chrono::Utc::now().timestamp_millis() as u64;
     match event {
         StreamEvent::Trade { price, .. } => {
-            if price > 0.0 { state.spot_price = price; }
+            if price > 0.0 {
+                state.spot_price = price;
+                state.last_spot_update_ms = now_ms;
+            }
         }
 
         StreamEvent::Kline { close, volume, is_closed, .. } => {
@@ -74,6 +78,7 @@ pub(crate) fn update_history(state: &mut FeatureState, event: StreamEvent) {
                 let prev_close = state.closes_1m.newest();
                 state.closes_1m.push(close);
                 state.volumes_1m.push(volume.max(0.0));
+                state.last_kline_update_ms = now_ms;
                 // Only emit a return when there's a real prior close to diff against
                 if let Some(prev) = prev_close {
                     if prev > 0.0 {
@@ -87,7 +92,10 @@ pub(crate) fn update_history(state: &mut FeatureState, event: StreamEvent) {
         }
 
         StreamEvent::MarkPrice { mark_price, .. } => {
-            if mark_price > 0.0 { state.mark_price = mark_price; }
+            if mark_price > 0.0 {
+                state.mark_price = mark_price;
+                state.last_mark_update_ms = now_ms;
+            }
         }
 
         StreamEvent::FundingRate { funding_rate, .. } => {
@@ -109,7 +117,10 @@ pub(crate) fn update_history(state: &mut FeatureState, event: StreamEvent) {
         }
 
         StreamEvent::ChainlinkPrice { price, .. } => {
-            if price > 0.0 { state.chainlink_price = price; }
+            if price > 0.0 {
+                state.chainlink_price = price;
+                state.last_chainlink_update_ms = now_ms;
+            }
         }
 
         StreamEvent::ClobBook {
@@ -124,6 +135,7 @@ pub(crate) fn update_history(state: &mut FeatureState, event: StreamEvent) {
                 last_trade_price,
                 timestamp_ms,
             });
+            state.last_book_update_ms = now_ms;
         }
 
         // Comments (D3) deferred

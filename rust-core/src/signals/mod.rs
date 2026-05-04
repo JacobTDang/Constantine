@@ -54,6 +54,18 @@ pub struct SignalConfig {
     pub min_liquidity_usd:          f64,   // Skip thin books (typ. 100)
     pub max_spread:                 f64,   // Skip broken books (typ. 0.10)
     pub min_window_age_secs:        f64,   // Skip just-opened windows (typ. 15)
+
+    // S7.2 — depth-aware gates. A BUY oracle signal hits the ASK side
+    // specifically — we want enough size at the touch to absorb our bet
+    // without consuming the whole touch (which would mean huge slippage).
+    /// Skip oracle BUYs if the touched ASK side has < this in dollars (typ. 50).
+    pub min_ask_depth_usd:          f64,
+    /// Reject a fill that would consume more than this fraction of the touch
+    /// (typ. 0.5 = 50%). Caller passes their bet; we check at signal time
+    /// using max_bet_dollars as the conservative bound.
+    pub max_touch_consumption:      f64,
+    /// Caller's max bet — used in the touch-consumption check. Default $30.
+    pub max_bet_dollars:            f64,
 }
 
 impl Default for SignalConfig {
@@ -66,6 +78,9 @@ impl Default for SignalConfig {
             min_liquidity_usd:       100.0,
             max_spread:              0.10,
             min_window_age_secs:     15.0,
+            min_ask_depth_usd:       50.0,
+            max_touch_consumption:   0.5,
+            max_bet_dollars:         30.0,
         }
     }
 }
@@ -217,6 +232,21 @@ pub fn evaluate_signals_for_market(
             state.spot_price, strike, state.vol_5m, time_remaining_min,
             yes_ask, no_ask, cfg.oracle_arb_threshold,
         ) {
+            // S7.2 — depth-aware gate. We'd hit the ASK side of whichever
+            // direction the signal points. Reject if depth is thin or our
+            // bet would consume too much of the touch (worst-case max bet).
+            use crate::signals::Direction;
+            let (touch_size, touch_price) = match sig.direction {
+                Direction::Up   => (yes_book.best_ask_size, yes_book.best_ask),
+                Direction::Down => (no_book.best_ask_size,  no_book.best_ask),
+            };
+            let touch_usd = touch_size * touch_price;
+            if touch_usd < cfg.min_ask_depth_usd {
+                return SignalDecision::None;   // too thin to fill cleanly
+            }
+            if touch_usd > 0.0 && cfg.max_bet_dollars / touch_usd > cfg.max_touch_consumption {
+                return SignalDecision::None;   // bet would eat too much of the touch
+            }
             return SignalDecision::Oracle(sig);
         }
     }
@@ -712,6 +742,71 @@ mod tests {
         let m2_dec = results.iter().find(|(id, _)| id == "m2").map(|(_, d)| d.clone());
         assert!(matches!(m1_dec, Some(SignalDecision::Oracle(_))));
         assert_eq!(m2_dec, Some(SignalDecision::None));   // thin → None
+    }
+
+    // ── S7.2: depth-aware gate ────────────────────────────────────────────
+
+    #[test]
+    fn oracle_signal_rejected_when_ask_depth_thin() {
+        let mut s = FeatureState::default();
+        s.spot_price = 80_300.0;
+        s.window_strikes.insert("m".into(), (0, 80_000.0));
+        let now_ms = 1_000_000_000_000u64;
+        let m = sample_market_for("m", now_ms + 60_000);
+        // YES underpriced (oracle would fire) but ASK touch is tiny — 5 shares × 0.45 = $2.25
+        s.asset_books.insert(m.up_token_id.clone(),   book(0.40, 0.45, 5.0));
+        s.asset_books.insert(m.down_token_id.clone(), book(0.50, 0.55, 1000.0));
+        let mut cfg = SignalConfig::default();
+        cfg.min_window_age_secs = 0.0;
+        cfg.min_liquidity_usd   = 0.0;     // turn off OTHER gate so depth gate is exercised
+        cfg.min_ask_depth_usd   = 50.0;
+        // Should be None due to thin ask depth on YES
+        assert_eq!(
+            evaluate_signals_for_market(&m, &s, &cfg, now_ms),
+            SignalDecision::None,
+        );
+    }
+
+    #[test]
+    fn oracle_signal_rejected_when_bet_too_big_for_touch() {
+        let mut s = FeatureState::default();
+        s.spot_price = 80_300.0;
+        s.window_strikes.insert("m".into(), (0, 80_000.0));
+        let now_ms = 1_000_000_000_000u64;
+        let m = sample_market_for("m", now_ms + 60_000);
+        // YES depth = 100 × 0.45 = $45 — passes min_ask_depth ($50? NO. set to $40)
+        // But max_bet ($30) / $45 = 67% — exceeds 50% cap
+        s.asset_books.insert(m.up_token_id.clone(),   book(0.40, 0.45, 100.0));
+        s.asset_books.insert(m.down_token_id.clone(), book(0.50, 0.55, 1000.0));
+        let mut cfg = SignalConfig::default();
+        cfg.min_window_age_secs    = 0.0;
+        cfg.min_liquidity_usd      = 0.0;
+        cfg.min_ask_depth_usd      = 40.0;
+        cfg.max_bet_dollars        = 30.0;
+        cfg.max_touch_consumption  = 0.5;
+        assert_eq!(
+            evaluate_signals_for_market(&m, &s, &cfg, now_ms),
+            SignalDecision::None,
+        );
+    }
+
+    #[test]
+    fn oracle_signal_accepted_with_deep_ask() {
+        let mut s = FeatureState::default();
+        s.spot_price = 80_300.0;
+        s.window_strikes.insert("m".into(), (0, 80_000.0));
+        let now_ms = 1_000_000_000_000u64;
+        let m = sample_market_for("m", now_ms + 60_000);
+        // Deep book — both sides ample
+        s.asset_books.insert(m.up_token_id.clone(),   book(0.40, 0.45, 5000.0));
+        s.asset_books.insert(m.down_token_id.clone(), book(0.50, 0.55, 5000.0));
+        let mut cfg = SignalConfig::default();
+        cfg.min_window_age_secs = 0.0;
+        let d = evaluate_signals_for_market(&m, &s, &cfg, now_ms);
+        match d {
+            SignalDecision::Oracle(_) => {}   // expected
+            other => panic!("expected Oracle, got {other:?}"),
+        }
     }
 
     #[test]

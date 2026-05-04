@@ -93,6 +93,15 @@ pub struct FeatureState {
 
     // Sequence counter — incremented every 500ms tick, read by Python IPC
     pub seq: u64,
+
+    // ── S7: staleness tracking — last-update timestamps per stream ────────
+    // Watchdog reads these to trip the kill switch when a stream goes
+    // dark. Updated by update_history() on every event.
+    pub last_spot_update_ms:      u64,
+    pub last_mark_update_ms:      u64,
+    pub last_chainlink_update_ms: u64,
+    pub last_book_update_ms:      u64,
+    pub last_kline_update_ms:     u64,
 }
 
 impl Default for FeatureState {
@@ -150,6 +159,12 @@ impl Default for FeatureState {
             window_open_price: 0.0,
 
             seq: 0,
+
+            last_spot_update_ms:      0,
+            last_mark_update_ms:      0,
+            last_chainlink_update_ms: 0,
+            last_book_update_ms:      0,
+            last_kline_update_ms:     0,
         }
     }
 }

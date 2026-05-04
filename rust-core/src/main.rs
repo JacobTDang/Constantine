@@ -97,6 +97,22 @@ async fn main() -> anyhow::Result<()> {
     // S5/S6 — risk limits + execution runner shared across spawns.
     let risk_limits = Arc::new(risk::limits::RiskLimits::new());
 
+    // S7.1+S7.3 — Watchdog: trips kill switch on data-loss / time-sync drift.
+    // trip_kill_switch only takes effect when execution is enabled (in observe
+    // mode the kill switch is harmless because we never submit anyway).
+    let watchdog_cfg = risk::watchdog::WatchdogConfig {
+        trip_kill_switch: exec_cfg.is_some(),
+        ..Default::default()
+    };
+    tasks.spawn(risk::watchdog::watchdog_loop(
+        state.clone(), risk_limits.clone(), watchdog_cfg,
+    ));
+
+    // S7.4 — Heartbeat: 30s status log so ops can grep "HB".
+    tasks.spawn(risk::heartbeat::heartbeat_loop(
+        state.clone(), risk_limits.clone(), positions.clone(), 30,
+    ));
+
     // J11: Window-open hook — populates the order pool the moment a new
     // BTC window's strike is captured. Spawning is gated on full config
     // since pre-signing requires a private key + sig type.
@@ -162,6 +178,9 @@ async fn main() -> anyhow::Result<()> {
                     min_liquidity_usd:       c.min_liquidity,
                     max_spread:              0.10,
                     min_window_age_secs:     15.0,
+                    min_ask_depth_usd:       50.0,
+                    max_touch_consumption:   0.5,
+                    max_bet_dollars:         c.max_bet_dollars,
                 };
                 let runner_cfg = execution::runner::RunnerConfig::default();
                 tasks.spawn(execution::runner::execution_runner_loop(
