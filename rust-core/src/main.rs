@@ -25,6 +25,10 @@ async fn main() -> anyhow::Result<()> {
     // C11: shared feature state, written by compute_loop, read by IPC + signals
     let state = Arc::new(tokio::sync::RwLock::new(FeatureState::default()));
 
+    // D1: shared list of active BTC markets, refreshed every 5 minutes
+    let markets: Arc<tokio::sync::RwLock<Vec<streams::polymarket::PolyMarket>>> =
+        Arc::new(tokio::sync::RwLock::new(Vec::new()));
+
     let mut tasks = tokio::task::JoinSet::new();
 
     // Data streams (B1-B6)
@@ -37,7 +41,10 @@ async fn main() -> anyhow::Result<()> {
     // Feature compute loop (C11)
     tasks.spawn(features::compute_loop(tx.subscribe(), state.clone()));
 
-    tracing::info!("all tasks started — streams + feature compute loop active");
+    // Polymarket market discovery (D1)
+    tasks.spawn(streams::polymarket::market_discovery_loop(markets.clone()));
+
+    tracing::info!("all tasks started — streams + features + market discovery active");
 
     // Signal, execution, IPC tasks join in later phases.
     tasks.join_all().await;
