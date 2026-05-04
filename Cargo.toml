@@ -3,9 +3,17 @@ name = "polymarket-bot"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "polymarket_bot"
+path = "rust-core/src/lib.rs"
+
 [[bin]]
 name = "polymarket-bot"
 path = "rust-core/src/main.rs"
+
+[[bin]]
+name = "dashboard"
+path = "rust-core/src/bin/dashboard.rs"
 
 [dependencies]
 tokio             = { version = "1",    features = ["full"] }

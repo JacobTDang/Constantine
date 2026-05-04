@@ -14,6 +14,7 @@
 // which reads both files and joins on market_id. The live process only
 // appends — it doesn't have to update past records.
 
+pub mod dashboard;
 pub mod positions;
 pub mod settlement;
 

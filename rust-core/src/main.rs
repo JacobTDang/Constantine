@@ -1,17 +1,10 @@
-mod config;
-mod execution;
-mod features;
-mod ipc;
-mod logging;
-mod risk;
-mod signals;
-mod storage;
-mod streams;
-
 use std::sync::Arc;
 
-pub use config::Config;
-use features::FeatureState;
+use polymarket_bot::{
+    config::Config,
+    execution, features, ipc, logging, risk, signals, storage, streams,
+};
+use polymarket_bot::features::FeatureState;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
