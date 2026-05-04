@@ -459,6 +459,47 @@ fn best_level(levels: &[serde_json::Value], side: BookSide) -> (f64, f64) {
     }
 }
 
+// ── D6: CLOB orchestrator ────────────────────────────────────────────────────
+
+/// Watches the shared markets list and (re)spawns clob_stream whenever the
+/// set of asset IDs changes. Polls every 60 seconds.
+///
+/// This is what keeps the CLOB connection in sync with D1's market discovery
+/// — when new windows open and old ones resolve, the asset_ids change and
+/// we restart the CLOB stream.
+pub async fn clob_orchestrator(
+    markets: Arc<RwLock<Vec<PolyMarket>>>,
+    tx:      broadcast::Sender<StreamEvent>,
+) {
+    let mut last_ids:  Vec<String> = Vec::new();
+    let mut current:   Option<tokio::task::JoinHandle<()>> = None;
+
+    loop {
+        let mut ids: Vec<String> = markets
+            .read()
+            .await
+            .iter()
+            .flat_map(|m| [m.up_token_id.clone(), m.down_token_id.clone()])
+            .collect();
+        ids.sort();
+        ids.dedup();
+
+        if ids != last_ids {
+            if let Some(h) = current.take() {
+                h.abort();
+            }
+            if !ids.is_empty() {
+                let tx = tx.clone();
+                let new_ids = ids.clone();
+                current = Some(tokio::spawn(clob_stream(tx, new_ids)));
+                tracing::info!(n = ids.len(), "clob stream restarted with new asset list");
+            }
+            last_ids = ids;
+        }
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    }
+}
+
 /// Decode `latestRoundData()` ABI-encoded response.
 /// Layout (5 × 32-byte values): [roundId, answer, startedAt, updatedAt, answeredInRound]
 /// Returns (price_usd, updated_at_unix_secs).

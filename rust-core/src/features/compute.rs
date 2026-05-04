@@ -300,6 +300,27 @@ pub fn compute_liq_imbalance(
     (short_qty - long_qty) / total
 }
 
+// ── D5: Polymarket microstructure helpers ─────────────────────────────────────
+
+/// Order-book imbalance on the YES (Up) side: positive = bid-heavy (buyers
+/// stacked), negative = ask-heavy (sellers stacked). Range (-1, 1).
+pub fn compute_obi(bid_size: f64, ask_size: f64) -> f64 {
+    let total = bid_size + ask_size;
+    if total < 1e-8 { return 0.0; }
+    (bid_size - ask_size) / total
+}
+
+/// Intramarket arb gap: 1 - (yes_ask + no_ask). Positive = arb opportunity
+/// (you can buy both sides for less than $1 → guaranteed profit minus fees).
+pub fn compute_arb_gap(yes_ask: f64, no_ask: f64) -> f64 {
+    1.0 - (yes_ask + no_ask)
+}
+
+/// Bid-ask spread on the YES side. Used as a liquidity / cost-to-trade signal.
+pub fn compute_spread(best_bid: f64, best_ask: f64) -> f64 {
+    (best_ask - best_bid).max(0.0)
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -311,6 +332,52 @@ mod tests {
         let mut w = RollingWindow::new(vals.len().max(60));
         for &v in vals { w.push(v); }
         w
+    }
+
+    // ── D5: microstructure helpers ────────────────────────────────────────
+
+    #[test]
+    fn obi_balanced_is_zero() {
+        assert!((compute_obi(100.0, 100.0)).abs() < 1e-10);
+    }
+
+    #[test]
+    fn obi_bid_heavy_positive() {
+        assert!(compute_obi(200.0, 100.0) > 0.0);
+    }
+
+    #[test]
+    fn obi_ask_heavy_negative() {
+        assert!(compute_obi(100.0, 200.0) < 0.0);
+    }
+
+    #[test]
+    fn obi_clamps_at_extremes() {
+        assert!((compute_obi(100.0, 0.0) - 1.0).abs() < 1e-10);
+        assert!((compute_obi(0.0, 100.0) + 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn obi_zero_total_is_zero() {
+        assert!(compute_obi(0.0, 0.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn arb_gap_positive_when_combined_below_one() {
+        // YES ask 0.45, NO ask 0.50 → 1 - 0.95 = 0.05 (arb)
+        assert!((compute_arb_gap(0.45, 0.50) - 0.05).abs() < 1e-10);
+    }
+
+    #[test]
+    fn arb_gap_negative_when_combined_above_one() {
+        assert!(compute_arb_gap(0.55, 0.50) < 0.0);
+    }
+
+    #[test]
+    fn spread_clamps_negative_to_zero() {
+        // Should never be negative — but defend against malformed books
+        assert_eq!(compute_spread(0.50, 0.49), 0.0);
+        assert!((compute_spread(0.49, 0.51) - 0.02).abs() < 1e-10);
     }
 
     // ── C2: RollingWindow ─────────────────────────────────────────────────

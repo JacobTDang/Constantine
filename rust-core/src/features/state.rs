@@ -1,10 +1,21 @@
 // C1: FeatureState — all rolling history buffers and computed feature values.
 // Computation functions are added in C3-C10 and wired in C11.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use crate::streams::LiqSide;
 use super::compute::RollingWindow;
+
+/// Latest CLOB book snapshot for a single asset (Up or Down token).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BookState {
+    pub best_bid:         f64,
+    pub best_ask:         f64,
+    pub best_bid_size:    f64,
+    pub best_ask_size:    f64,
+    pub last_trade_price: f64,
+    pub timestamp_ms:     u64,
+}
 
 // Capacities (in number of 1-minute candles unless noted)
 const HIST_60M:  usize = 60;   // 60 candles = 1 hour of 1-min history
@@ -24,6 +35,11 @@ pub struct FeatureState {
     pub returns_1m:  RollingWindow<f64>,  // log returns between closes
     pub oi_history:  VecDeque<(u64, f64)>,              // (timestamp_ms, oi_btc)
     pub liq_history: VecDeque<(u64, LiqSide, f64)>,    // (timestamp_ms, side, qty)
+
+    // ── Polymarket per-market state (D5/D6) ───────────────────────────────
+    pub asset_books:    HashMap<String, BookState>,    // asset_id -> latest book
+    pub window_strikes: HashMap<String, f64>,          // market_id -> chainlink price captured at window open
+    pub primary_market_id: Option<String>,             // currently-selected primary market for feature output
 
     // ── Feature vector — 26 fields, written to IPC every 500ms ───────────
 
@@ -82,6 +98,10 @@ impl Default for FeatureState {
             returns_1m:  RollingWindow::new(HIST_60M),
             oi_history:  VecDeque::with_capacity(OI_HIST),
             liq_history: VecDeque::with_capacity(LIQ_HIST),
+
+            asset_books:        HashMap::new(),
+            window_strikes:     HashMap::new(),
+            primary_market_id:  None,
 
             ret_1m: 0.0,
             ret_3m: 0.0,

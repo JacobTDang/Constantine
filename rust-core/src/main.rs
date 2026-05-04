@@ -38,14 +38,15 @@ async fn main() -> anyhow::Result<()> {
     tasks.spawn(streams::binance::kline_stream(tx.clone()));
     tasks.spawn(streams::liquidations::liq_stream(tx.clone()));
 
-    // Feature compute loop (C11)
-    tasks.spawn(features::compute_loop(tx.subscribe(), state.clone()));
+    // Feature compute loop (C11 + D6 — reads markets to compute poly features)
+    tasks.spawn(features::compute_loop(tx.subscribe(), state.clone(), markets.clone()));
 
-    // Polymarket market discovery (D1) + Chainlink BTC/USD polling (D2)
+    // Polymarket: market discovery (D1) + Chainlink polling (D2) + CLOB orchestrator (D4/D6)
     tasks.spawn(streams::polymarket::market_discovery_loop(markets.clone()));
     tasks.spawn(streams::polymarket::chainlink_polling_loop(tx.clone()));
+    tasks.spawn(streams::polymarket::clob_orchestrator(markets.clone(), tx.clone()));
 
-    tracing::info!("all tasks started — streams + features + market discovery + chainlink");
+    tracing::info!("all tasks started — streams + features + market discovery + chainlink + clob");
 
     // Signal, execution, IPC tasks join in later phases.
     tasks.join_all().await;
