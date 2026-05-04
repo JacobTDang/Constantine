@@ -1,0 +1,43 @@
+# Rust
+target/
+# Cargo.lock IS committed — this is a binary application, not a library
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+.env
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+
+# Data: keep directory structure, ignore contents
+data/models/*.txt
+data/models/*.pkl
+data/models/*.bin
+data/logs/*.log
+data/logs/*.jsonl
+data/db/*.db
+data/db/*.sqlite
+data/raw/
+
+# IDE / tools
+.vscode/
+.idea/
+*.swp
+.claude/settings.local.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets
+.env
+*.pem
+*.key
