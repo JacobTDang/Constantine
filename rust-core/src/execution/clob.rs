@@ -68,7 +68,10 @@ impl OrderType {
 
 #[derive(Debug, Clone, Serialize)]
 struct OrderWire {
-    salt:           String,
+    /// JSON number, NOT a string — matches rs-clob-client. Pre-sign generates
+    /// u64 salts placed in the low 8 bytes of the 32-byte hash input, so the
+    /// uint256 value always fits a u64.
+    salt:           u64,
     maker:          String,
     signer:         String,
     taker:          String,
@@ -94,6 +97,9 @@ struct SubmitBody {
     owner:      String,
     #[serde(rename = "orderType")]
     order_type: String,
+    /// Only emitted when set — Polymarket's API treats absence as "not post-only".
+    #[serde(rename = "postOnly", skip_serializing_if = "Option::is_none")]
+    post_only:  Option<bool>,
 }
 
 /// Schema-validated decode of the Polymarket /order response.
@@ -154,13 +160,18 @@ pub struct ClobConfig {
     pub creds:            ApiCreds,
     pub dry_run:          bool,
     pub order_type:       OrderType,
+    /// Optional post-only flag (rests on the book; rejects if it would cross).
+    /// None = let Polymarket use its default behaviour.
+    pub post_only:        Option<bool>,
     pub max_retries:      u32,       // total attempts = max_retries + 1
     pub initial_backoff_ms: u64,
     pub request_timeout: Duration,
 }
 
 impl ClobConfig {
-    /// Sensible production defaults: 3 retries, 100ms initial backoff, 5s req timeout.
+    /// Sensible production defaults: FAK time-in-force (partial fill OK,
+    /// remainder cancelled — right for short-window directional trades),
+    /// 3 retries, 100ms initial backoff, 5s req timeout.
     pub fn new(
         address: impl Into<String>,
         creds:   ApiCreds,
@@ -171,7 +182,8 @@ impl ClobConfig {
             address:            address.into(),
             creds,
             dry_run,
-            order_type:         OrderType::Gtc,
+            order_type:         OrderType::Fak,
+            post_only:          None,
             max_retries:        3,
             initial_backoff_ms: 100,
             request_timeout:    Duration::from_secs(5),
@@ -200,7 +212,12 @@ impl ClobClient {
     /// Submit a pre-signed order. In DRY_RUN this returns a synthetic success
     /// without ever touching the network.
     pub async fn submit_order(&self, signed: &SignedOrder) -> Result<SubmitOutcome> {
-        let body = build_submit_body(signed, &self.cfg.creds.api_key, self.cfg.order_type)?;
+        let body = build_submit_body(
+            signed,
+            &self.cfg.creds.api_key,
+            self.cfg.order_type,
+            self.cfg.post_only,
+        )?;
         let body_str = serde_json::to_string(&body).context("serialize order body")?;
 
         if self.cfg.dry_run {
@@ -306,9 +323,19 @@ impl ClobClient {
 
 // ── Wire conversion ──────────────────────────────────────────────────────────
 
-fn signed_to_wire(signed: &SignedOrder) -> OrderWire {
-    OrderWire {
-        salt:           u256_to_dec(&signed.order.salt),
+fn signed_to_wire(signed: &SignedOrder) -> Result<OrderWire> {
+    // Salt is generated in presign as a u64 padded into a 32-byte word with
+    // the high 24 bytes zero. Verify that invariant and extract the u64.
+    let salt32 = &signed.order.salt;
+    if salt32[..24].iter().any(|&b| b != 0) {
+        anyhow::bail!("salt does not fit in u64 — high 24 bytes nonzero");
+    }
+    let mut salt8 = [0u8; 8];
+    salt8.copy_from_slice(&salt32[24..]);
+    let salt_u64 = u64::from_be_bytes(salt8);
+
+    Ok(OrderWire {
+        salt:           salt_u64,
         maker:          address_to_hex(&signed.order.maker),
         signer:         address_to_hex(&signed.order.signer),
         taker:          address_to_hex(&signed.order.taker),
@@ -321,21 +348,23 @@ fn signed_to_wire(signed: &SignedOrder) -> OrderWire {
         side:           signed.order.side.as_str().to_string(),
         signature_type: signed.order.signature_type as u8,
         signature:      format!("0x{}", hex::encode(signed.signature)),
-    }
+    })
 }
 
 fn build_submit_body(
     signed:     &SignedOrder,
     owner:      &str,
     order_type: OrderType,
+    post_only:  Option<bool>,
 ) -> Result<SubmitBody> {
     if owner.is_empty() {
         bail!("owner (api_key) must not be empty");
     }
     Ok(SubmitBody {
-        order:      signed_to_wire(signed),
+        order:      signed_to_wire(signed)?,
         owner:      owner.to_string(),
         order_type: order_type.as_str().to_string(),
+        post_only,
     })
 }
 
@@ -358,7 +387,8 @@ mod tests {
     fn sample_signed() -> SignedOrder {
         let addr = hex_to_address(TEST_ADDR).unwrap();
         let order = Order {
-            salt:           [1u8; 32],
+            // salt MUST fit in u64 — wire format demands it.
+            salt:           u256_from_u64(0x0123_4567_89AB_CDEF),
             maker:          addr,
             signer:         addr,
             taker:          [0u8; 20],
@@ -396,7 +426,7 @@ mod tests {
     #[test]
     fn signed_to_wire_serialises_amounts_as_decimal_strings() {
         let signed = sample_signed();
-        let wire = signed_to_wire(&signed);
+        let wire = signed_to_wire(&signed).unwrap();
         assert_eq!(wire.maker_amount, "5000000");
         assert_eq!(wire.taker_amount, "10000000");
         assert_eq!(wire.token_id,     "123456789");
@@ -405,8 +435,27 @@ mod tests {
     }
 
     #[test]
+    fn signed_to_wire_salt_is_u64_number() {
+        let signed = sample_signed();
+        let wire = signed_to_wire(&signed).unwrap();
+        // Round-trips through the wire layer
+        assert_eq!(wire.salt, 0x0123_4567_89AB_CDEF_u64);
+        // And serialises as a JSON number, not a string.
+        let json = serde_json::to_value(&wire).unwrap();
+        assert!(json.get("salt").unwrap().is_number(), "salt must be a JSON number, not string");
+    }
+
+    #[test]
+    fn signed_to_wire_rejects_oversize_salt() {
+        // Salt with high bytes set would not fit in a u64.
+        let mut signed = sample_signed();
+        signed.order.salt[0] = 0xff;
+        assert!(signed_to_wire(&signed).is_err());
+    }
+
+    #[test]
     fn signed_to_wire_addresses_have_0x_prefix_and_40_hex() {
-        let wire = signed_to_wire(&sample_signed());
+        let wire = signed_to_wire(&sample_signed()).unwrap();
         assert!(wire.maker.starts_with("0x") && wire.maker.len() == 42);
         assert!(wire.signer.starts_with("0x") && wire.signer.len() == 42);
         assert!(wire.taker.starts_with("0x") && wire.taker.len() == 42);
@@ -414,7 +463,7 @@ mod tests {
 
     #[test]
     fn signed_to_wire_signature_is_0x_prefixed_130_hex() {
-        let wire = signed_to_wire(&sample_signed());
+        let wire = signed_to_wire(&sample_signed()).unwrap();
         assert!(wire.signature.starts_with("0x"));
         // 65 bytes * 2 hex + 2 ("0x") = 132
         assert_eq!(wire.signature.len(), 132);
@@ -422,7 +471,7 @@ mod tests {
 
     #[test]
     fn taker_zero_address_serialises_as_all_zeros() {
-        let wire = signed_to_wire(&sample_signed());
+        let wire = signed_to_wire(&sample_signed()).unwrap();
         assert_eq!(wire.taker, "0x0000000000000000000000000000000000000000");
     }
 
@@ -431,20 +480,21 @@ mod tests {
     #[test]
     fn build_submit_body_includes_owner_and_order_type() {
         let signed = sample_signed();
-        let body = build_submit_body(&signed, "uuid-here", OrderType::Fok).unwrap();
+        let body = build_submit_body(&signed, "uuid-here", OrderType::Fok, None).unwrap();
         assert_eq!(body.owner, "uuid-here");
         assert_eq!(body.order_type, "FOK");
+        assert!(body.post_only.is_none());
     }
 
     #[test]
     fn build_submit_body_rejects_empty_owner() {
-        assert!(build_submit_body(&sample_signed(), "", OrderType::Gtc).is_err());
+        assert!(build_submit_body(&sample_signed(), "", OrderType::Gtc, None).is_err());
     }
 
     #[test]
     fn submit_body_serialises_to_expected_json_keys() {
         let signed = sample_signed();
-        let body = build_submit_body(&signed, "u", OrderType::Gtc).unwrap();
+        let body = build_submit_body(&signed, "u", OrderType::Gtc, None).unwrap();
         let json = serde_json::to_value(&body).unwrap();
         let order = json.get("order").unwrap();
         for key in ["salt", "maker", "signer", "taker", "tokenId",
@@ -454,6 +504,16 @@ mod tests {
         }
         assert!(json.get("owner").is_some());
         assert!(json.get("orderType").is_some());
+        // post_only is absent when None
+        assert!(json.get("postOnly").is_none());
+    }
+
+    #[test]
+    fn submit_body_post_only_appears_when_set() {
+        let signed = sample_signed();
+        let body = build_submit_body(&signed, "u", OrderType::Gtc, Some(true)).unwrap();
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json.get("postOnly").unwrap().as_bool(), Some(true));
     }
 
     // ── ClobApiResponse parsing ───────────────────────────────────────────
@@ -512,7 +572,10 @@ mod tests {
         let cfg = ClobConfig::new(TEST_ADDR, sample_creds(), true);
         assert_eq!(cfg.base_url, POLYMARKET_CLOB_BASE_URL);
         assert!(cfg.dry_run);
-        assert_eq!(cfg.order_type, OrderType::Gtc);
+        // FAK is the right default for short-window directional trades —
+        // partial fills OK, remainder cancelled (no resting on the book).
+        assert_eq!(cfg.order_type, OrderType::Fak);
+        assert!(cfg.post_only.is_none());
         assert_eq!(cfg.max_retries, 3);
         assert_eq!(cfg.initial_backoff_ms, 100);
     }

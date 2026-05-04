@@ -158,8 +158,15 @@ pub async fn execute_signal(
         };
     }
 
-    // 6. Success → record exposure, return Submitted.
-    ctx.risk.record_open(bet);
+    // 6. Success → record exposure (only when real, not dry-run), return Submitted.
+    //
+    // We deliberately skip risk.record_open in DRY_RUN: otherwise the daily
+    // trade count fills up after ~max_daily_trades fake signals and would
+    // block a real trade if the user later flips DRY_RUN off without a reset.
+    // Tests cover both branches.
+    if !outcome.dry_run {
+        ctx.risk.record_open(bet);
+    }
     tracing::info!(
         bet,
         price = target.price,
@@ -526,9 +533,11 @@ mod tests {
 
         // Pool was decremented by exactly one
         assert_eq!(pool.len(), pool_size_before - 1);
-        // Risk recorded the trade
-        assert_eq!(risk.daily_trade_count(), 1);
-        assert!(risk.open_exposure_dollars() > 0.0);
+        // DRY_RUN must NOT consume daily trade count or exposure budget —
+        // otherwise after max_daily_trades fake signals the bot would block
+        // a real trade if the user flips DRY_RUN off without resetting state.
+        assert_eq!(risk.daily_trade_count(),    0);
+        assert_eq!(risk.open_exposure_dollars(), 0.0);
     }
 
     #[tokio::test]
@@ -789,13 +798,66 @@ mod tests {
         let dec = oracle_up_signal(0.45, 0.85);
         let outcome = execute_signal(&dec, &ctx).await;
         assert!(matches!(outcome, ExecOutcome::Submitted { .. }));
-        assert_eq!(risk.daily_trade_count(), 1);
 
         // Down signal at 55¢ — should hit NO ladder, independently.
         let dec_d = oracle_down_signal(0.55, 0.85);
         let outcome_d = execute_signal(&dec_d, &ctx).await;
         assert!(matches!(outcome_d, ExecOutcome::Submitted { .. }));
-        assert_eq!(risk.daily_trade_count(), 2);
+
+        // DRY_RUN: trade count stays at zero (see executor.rs comment in submit path).
+        assert_eq!(risk.daily_trade_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn live_mode_records_open_exposure() {
+        // Spin up a tiny mock server returning success=true so we hit the
+        // non-dry-run record_open path.
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mock = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 8192];
+                let _ = sock.read(&mut buf).await;
+                let body = r#"{"success":true,"orderID":"0xok","status":"matched"}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
+                    body.len(), body,
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let pool = OrderPool::new();
+        populate_pool_for_market(&pool, UP_TOKEN_ID);
+
+        let mut clob_cfg = crate::execution::clob::ClobConfig::new(TEST_ADDR, sample_creds(), false);
+        clob_cfg.base_url = format!("http://{}", addr);
+        clob_cfg.max_retries = 0;
+        clob_cfg.initial_backoff_ms = 1;
+        let client = crate::execution::clob::ClobClient::new(clob_cfg).unwrap();
+
+        let risk    = RiskLimits::new();
+        let cfg     = RiskConfig::default();
+        let state   = sample_state();
+        let markets = vec![sample_market()];
+        let ctx = ExecContext {
+            state: &state, markets: &markets,
+            risk: &risk, risk_cfg: &cfg,
+            pool: &pool, client: &client,
+        };
+
+        let dec = oracle_up_signal(0.45, 0.85);
+        let outcome = execute_signal(&dec, &ctx).await;
+        match outcome {
+            ExecOutcome::Submitted { dry_run, .. } => assert!(!dry_run),
+            other => panic!("expected Submitted (live), got {other:?}"),
+        }
+        // Live path: record_open must have fired
+        assert_eq!(risk.daily_trade_count(), 1);
+        assert!(risk.open_exposure_dollars() > 0.0);
+
+        let _ = mock.await;
     }
 
     #[tokio::test]

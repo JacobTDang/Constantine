@@ -13,7 +13,6 @@
 
 use anyhow::{bail, Context, Result};
 use dashmap::DashMap;
-use uuid::Uuid;
 
 use crate::execution::orders::{
     sign_order, u256_from_u64, Domain, Order, Side, SignatureType, SignedOrder,
@@ -125,15 +124,24 @@ impl OrderPool {
     pub fn clear(&self) { self.inner.clear(); }
 }
 
-/// Two concatenated UUID-v4s = 32 random bytes. uuid::Uuid::new_v4 uses
-/// `getrandom` (cryptographic OS entropy), which is what we want for salt.
+/// Generate a random u64 salt and place it in the low 8 bytes of a 32-byte
+/// big-endian uint256 word.
+///
+/// rs-clob-client (Polymarket's official Rust client) generates a u64 salt
+/// and serializes it as a JSON **number** in the wire format. We match that
+/// here so our wire format is byte-equivalent. The EIP-712 hash still folds
+/// in all 32 bytes (the high 24 are zero, which is fine — keccak doesn't
+/// care).
+///
+/// Source of randomness: `uuid::Uuid::new_v4` uses `getrandom` (OS CSPRNG).
+/// We pull 8 bytes off the end of a UUID-v4 to avoid adding a `rand` dep.
 fn random_salt() -> [u8; 32] {
-    let a = Uuid::new_v4();
-    let b = Uuid::new_v4();
-    let mut s = [0u8; 32];
-    s[..16].copy_from_slice(a.as_bytes());
-    s[16..].copy_from_slice(b.as_bytes());
-    s
+    let v = uuid::Uuid::new_v4();
+    let bytes = v.as_bytes();
+    let mut u64_bytes = [0u8; 8];
+    u64_bytes.copy_from_slice(&bytes[8..16]);
+    let salt_u64 = u64::from_be_bytes(u64_bytes);
+    u256_from_u64(salt_u64)
 }
 
 /// Build a BUY order at a given 1¢ price tick, sized to `bet_dollars`.
