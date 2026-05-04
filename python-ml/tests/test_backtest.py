@@ -183,6 +183,50 @@ def test_no_trades_returns_safe_zero_metrics():
     assert result.max_drawdown == 0.0
 
 
+def test_parallel_alpha_simulation_matches_sequential():
+    """The ProcessPoolExecutor path must produce IDENTICAL AlphaResults to
+    the sequential path. simulate_one_alpha takes a fixed seed, so the same
+    inputs must give the same numbers regardless of where they ran."""
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    n = 500
+    rng = np.random.default_rng(42)
+    p_model = rng.uniform(0.2, 0.8, n)
+    label = (rng.random(n) < p_model).astype(int)
+    timestamps = np.arange(n) * 5 * 60_000
+    alphas = [0.0, 0.3, 0.5, 0.7, 1.0]
+
+    cost = CostModel()
+    params = BacktestParams()
+
+    # Sequential reference
+    seq_results = [
+        simulate_one_alpha(p_model, label, timestamps, a, cost=cost, params=params)
+        for a in alphas
+    ]
+
+    # Parallel via the same path the real backtest uses
+    with ProcessPoolExecutor(max_workers=min(len(alphas), 4)) as pool:
+        futures = {
+            pool.submit(simulate_one_alpha, p_model, label, timestamps, a,
+                        cost=cost, params=params): a
+            for a in alphas
+        }
+        par_results = []
+        for fut in as_completed(futures):
+            par_results.append(fut.result())
+    par_results.sort(key=lambda r: r.alpha)
+
+    # Same alpha order, same numbers down to the cent
+    for s, p in zip(seq_results, par_results):
+        assert abs(s.alpha       - p.alpha)        < 1e-9
+        assert s.n_trades        == p.n_trades
+        assert abs(s.total_pnl   - p.total_pnl)    < 0.005, f"{s.total_pnl} vs {p.total_pnl}"
+        assert abs(s.win_rate    - p.win_rate)     < 1e-9
+        assert s.days_killed     == p.days_killed
+        assert s.passed_criteria == p.passed_criteria
+
+
 def test_realistic_signal_produces_positive_pnl_at_alpha_1():
     """Sanity: with TRUE signal model + uninformed market → must make money."""
     n = 1000

@@ -27,7 +27,9 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -316,15 +318,34 @@ def run_backtest(
     cal       = calibrate_model(y_holdout, p_holdout)
     log.info("holdout: n=%d brier=%.4f ece=%.4f", cal.n, cal.brier, cal.ece)
 
-    # 4. Simulate trading at each alpha
-    alpha_results = []
+    # 4. Simulate trading at each alpha — alphas are independent, fan out
+    #    across processes. ProcessPoolExecutor (not threads) because numpy
+    #    + the simulator are CPU-bound, and threads would hit the GIL.
     timestamps = holdout["prediction_time_ms"].to_numpy()
-    for alpha in params.market_alphas:
-        ar = simulate_one_alpha(
-            p_holdout, y_holdout, timestamps, alpha,
-            cost=cost, params=params,
-        )
-        alpha_results.append(ar)
+    n_workers = min(len(params.market_alphas), os.cpu_count() or 1)
+    log.info("simulating %d alphas across %d workers", len(params.market_alphas), n_workers)
+
+    if n_workers <= 1:
+        alpha_results = [
+            simulate_one_alpha(p_holdout, y_holdout, timestamps, a, cost=cost, params=params)
+            for a in params.market_alphas
+        ]
+    else:
+        with ProcessPoolExecutor(max_workers=n_workers) as pool:
+            futures = {
+                pool.submit(
+                    simulate_one_alpha,
+                    p_holdout, y_holdout, timestamps, a,
+                    cost=cost, params=params,
+                ): a for a in params.market_alphas
+            }
+            alpha_results = []
+            for fut in as_completed(futures):
+                alpha_results.append(fut.result())
+        # Restore stable order — as_completed gives them back in finish order
+        alpha_results.sort(key=lambda ar: ar.alpha)
+
+    for ar in alpha_results:
         log.info(
             "alpha=%.1f: trades=%d pnl=$%.2f sharpe=%.2f maxdd=%.1f%% win=%.1f%% killed=%d",
             ar.alpha, ar.n_trades, ar.total_pnl, ar.sharpe_annual,

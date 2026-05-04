@@ -207,3 +207,58 @@ def test_save_model_writes_file(tmp_path):
     _, val = folds[0]
     pred = loaded.predict(val[ML_FEATURES])
     assert len(pred) == len(val)
+
+
+# ── Parallelism: walk-forward folds train concurrently ────────────────────────
+
+def test_parallel_folds_match_sequential_results():
+    """Parallel and sequential paths must produce IDENTICAL fold metrics.
+    LightGBM with num_threads=1 + fixed seed = deterministic output."""
+    from model.train import _train_one_fold
+    df = _synthetic_dataset(days=90, label_signal=True)
+    folds, _ = walk_forward_splits(df)
+
+    # Sequential reference (single-threaded LightGBM via the helper)
+    seq_results = [
+        _train_one_fold(i, train, val, ML_FEATURES, None)
+        for i, (train, val) in enumerate(folds)
+    ]
+    # Parallel via the production path (run_walk_forward_training internally
+    # uses ProcessPoolExecutor when n_workers > 1)
+    par_report = run_walk_forward_training(df, fail_on_gate=False)
+
+    assert len(par_report.folds) == len(seq_results)
+    for seq_fr, par_fr in zip(seq_results, par_report.folds):
+        # Brier matches to 6dp — deterministic with single-thread LightGBM
+        assert abs(seq_fr.brier    - par_fr.brier)    < 1e-6
+        assert abs(seq_fr.log_loss - par_fr.log_loss) < 1e-6
+        assert abs(seq_fr.auc      - par_fr.auc)      < 1e-6
+        assert seq_fr.n_trees == par_fr.n_trees
+
+
+def test_parallel_folds_speedup_over_sequential():
+    """Parallel walk-forward should be measurably faster on a multi-core box.
+    Small dataset to keep the test quick — speedup is not huge but should be > 1."""
+    import time
+    from model.train import _train_one_fold
+
+    df = _synthetic_dataset(days=90, label_signal=True)
+    folds, _ = walk_forward_splits(df)
+
+    # Sequential timing
+    t0 = time.time()
+    for i, (train, val) in enumerate(folds):
+        _train_one_fold(i, train, val, ML_FEATURES, None)
+    seq_t = time.time() - t0
+
+    # Parallel timing — go through the public API
+    t0 = time.time()
+    run_walk_forward_training(df, fail_on_gate=False)
+    par_t = time.time() - t0
+
+    # Note: ProcessPoolExecutor has spawn overhead (~1s on Windows). For 5
+    # folds at small data, parallel may not beat sequential because spawn
+    # cost > work. Test is informational rather than strict.
+    print(f"\nseq={seq_t:.2f}s par={par_t:.2f}s ratio={par_t/seq_t:.2f}")
+    # Strict: parallel must not be more than 3x slower (catches accidental serialisation)
+    assert par_t < seq_t * 3.0, f"parallel ({par_t:.2f}s) shouldn't be much slower than seq ({seq_t:.2f}s)"

@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -211,6 +213,34 @@ def evaluate(booster: lgb.Booster, df: pd.DataFrame, feature_cols: list[str]) ->
     return brier, ll, auc
 
 
+def _train_one_fold(
+    fold_idx:     int,
+    train:        pd.DataFrame,
+    val:          pd.DataFrame,
+    feature_cols: list[str],
+    params:       Optional[dict],
+) -> "FoldReport":
+    """Train + evaluate one fold. Top-level fn so ProcessPoolExecutor can pickle it."""
+    # Force LightGBM to single-thread inside each worker — otherwise N workers
+    # × M LightGBM threads oversubscribes the box.
+    fold_params = {**(params or {}), "num_threads": 1, "verbose": -1}
+    booster = train_lgbm(train, val, feature_cols=feature_cols, params=fold_params)
+    brier, ll, auc = evaluate(booster, val, feature_cols)
+    return FoldReport(
+        fold_idx=fold_idx,
+        train_n=len(train),
+        val_n=len(val),
+        train_start_ms=int(train["prediction_time_ms"].iloc[0]),
+        train_end_ms=int(train["prediction_time_ms"].iloc[-1]),
+        val_start_ms=int(val["prediction_time_ms"].iloc[0]),
+        val_end_ms=int(val["prediction_time_ms"].iloc[-1]),
+        brier=brier,
+        log_loss=ll,
+        auc=auc,
+        n_trees=booster.best_iteration or booster.current_iteration(),
+    )
+
+
 def run_walk_forward_training(
     joined:          pd.DataFrame,
     *,
@@ -229,32 +259,39 @@ def run_walk_forward_training(
     folds, holdout = walk_forward_splits(joined)
     report = TrainingReport()
 
-    for i, (train, val) in enumerate(folds):
-        booster = train_lgbm(train, val, feature_cols=feature_cols, params=params)
-        brier, ll, auc = evaluate(booster, val, feature_cols)
+    # Train folds in parallel — each fold is independent. ProcessPoolExecutor
+    # because LightGBM internally uses threads for tree construction; running
+    # multiple folds in the SAME process would oversubscribe. Spawning N
+    # worker processes (each with single-thread LightGBM) is the right shape.
+    n_workers = min(len(folds), os.cpu_count() or 1)
+    log.info("training %d folds across %d workers", len(folds), n_workers)
 
-        fr = FoldReport(
-            fold_idx=i,
-            train_n=len(train),
-            val_n=len(val),
-            train_start_ms=int(train["prediction_time_ms"].iloc[0]),
-            train_end_ms=int(train["prediction_time_ms"].iloc[-1]),
-            val_start_ms=int(val["prediction_time_ms"].iloc[0]),
-            val_end_ms=int(val["prediction_time_ms"].iloc[-1]),
-            brier=brier,
-            log_loss=ll,
-            auc=auc,
-            n_trees=booster.best_iteration or booster.current_iteration(),
-        )
+    if n_workers <= 1:
+        fold_results = [
+            _train_one_fold(i, train, val, feature_cols, params)
+            for i, (train, val) in enumerate(folds)
+        ]
+    else:
+        with ProcessPoolExecutor(max_workers=n_workers) as pool:
+            futures = {
+                pool.submit(_train_one_fold, i, train, val, feature_cols, params): i
+                for i, (train, val) in enumerate(folds)
+            }
+            fold_results = [None] * len(folds)
+            for fut in as_completed(futures):
+                idx = futures[fut]
+                fold_results[idx] = fut.result()
+
+    for fr in fold_results:
         report.folds.append(fr)
         log.info(
             "fold %d: train=%d val=%d brier=%.4f ll=%.4f auc=%.4f trees=%d",
-            i, fr.train_n, fr.val_n, fr.brier, fr.log_loss, fr.auc, fr.n_trees,
+            fr.fold_idx, fr.train_n, fr.val_n, fr.brier, fr.log_loss, fr.auc, fr.n_trees,
         )
-
-        if brier > brier_gate:
-            msg = (f"fold {i} Brier {brier:.4f} exceeds gate {brier_gate:.4f} "
-                   f"— model is no better than baseline noise; aborting training")
+        if fr.brier > brier_gate:
+            msg = (f"fold {fr.fold_idx} Brier {fr.brier:.4f} exceeds gate "
+                   f"{brier_gate:.4f} — model is no better than baseline noise; "
+                   f"aborting training")
             if fail_on_gate:
                 raise RuntimeError(msg)
             log.warning(msg)
