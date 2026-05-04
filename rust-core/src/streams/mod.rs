@@ -67,14 +67,17 @@ pub enum StreamEvent {
     },
 
     // ── D4: Polymarket CLOB ───────────────────────────────────────────────
-    ClobUpdate {
-        market_id:    String,
-        best_bid_yes: f64,
-        best_ask_yes: f64,
-        best_bid_no:  f64,
-        best_ask_no:  f64,
-        bid_qty_yes:  f64,
-        ask_qty_yes:  f64,
+    /// Book snapshot for a single CLOB asset (Up token OR Down token).
+    /// Compute layer correlates Up + Down books per `market_id`.
+    ClobBook {
+        market_id:        String, // parent condition ID (0x...)
+        asset_id:         String, // CLOB token ID (Up or Down)
+        best_bid:         f64,
+        best_ask:         f64,
+        best_bid_size:    f64,
+        best_ask_size:    f64,
+        last_trade_price: f64,    // 0.0 when unknown
+        timestamp_ms:     u64,
     },
 }
 

@@ -16,9 +16,11 @@
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
+use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 use tokio::time::Duration;
+use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use super::StreamEvent;
 
@@ -295,6 +297,168 @@ async fn fetch_chainlink_btc(rpc_url: &str) -> Result<StreamEvent> {
     })
 }
 
+// ── D4: Polymarket CLOB order-book stream ────────────────────────────────────
+
+const CLOB_WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
+const CLOB_BACKOFF_INIT_SECS: u64 = 1;
+const CLOB_BACKOFF_MAX_SECS:  u64 = 30;
+
+/// Subscribe to one CLOB connection for the given asset IDs (mix of Up/Down
+/// tokens across multiple BTC markets) and emit ClobBook events.
+///
+/// Reconnects with exponential backoff. On reconnect, resubscribes.
+pub async fn clob_stream(tx: broadcast::Sender<StreamEvent>, asset_ids: Vec<String>) {
+    if asset_ids.is_empty() {
+        tracing::warn!("clob_stream called with no asset_ids — exiting");
+        return;
+    }
+    let subscribe_msg = serde_json::json!({
+        "type": "MARKET",
+        "assets_ids": asset_ids,
+    })
+    .to_string();
+
+    let mut backoff = Duration::from_secs(CLOB_BACKOFF_INIT_SECS);
+    loop {
+        tracing::info!(n = asset_ids.len(), "connecting to polymarket CLOB");
+        match run_clob(&subscribe_msg, &tx).await {
+            Ok(()) => {
+                tracing::warn!("clob stream closed cleanly, reconnecting");
+                backoff = Duration::from_secs(CLOB_BACKOFF_INIT_SECS);
+            }
+            Err(e) => {
+                tracing::error!(error = %e, retry_secs = backoff.as_secs(), "clob error");
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(CLOB_BACKOFF_MAX_SECS));
+            }
+        }
+    }
+}
+
+async fn run_clob(subscribe_msg: &str, tx: &broadcast::Sender<StreamEvent>) -> Result<()> {
+    let (ws, _) = connect_async(CLOB_WS_URL).await?;
+    tracing::info!("clob connected");
+    let (mut write, mut read) = ws.split();
+    write
+        .send(Message::Text(subscribe_msg.to_string()))
+        .await?;
+
+    while let Some(msg) = read.next().await {
+        match msg? {
+            Message::Text(text) => {
+                if text.trim().is_empty() {
+                    continue; // CLOB occasionally sends empty keepalives
+                }
+                for event in parse_clob_payload(&text) {
+                    let _ = tx.send(event);
+                }
+            }
+            Message::Close(_) => {
+                tracing::warn!("clob server closed");
+                break;
+            }
+            Message::Ping(p) => write.send(Message::Pong(p)).await?,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// CLOB messages are JSON arrays of book/price-change events, OR a single
+/// JSON object. We accept either shape and emit ClobBook events for "book"
+/// snapshots. price_change handling is deferred — book snapshots are
+/// frequent enough for current trading logic.
+pub fn parse_clob_payload(text: &str) -> Vec<StreamEvent> {
+    let v: serde_json::Value = match serde_json::from_str(text) {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
+
+    let items: Vec<&serde_json::Value> = match &v {
+        serde_json::Value::Array(arr) => arr.iter().collect(),
+        serde_json::Value::Object(_)  => vec![&v],
+        _ => return vec![],
+    };
+
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        if let Some(ev) = parse_book_event(item) {
+            out.push(ev);
+        }
+    }
+    out
+}
+
+fn parse_book_event(v: &serde_json::Value) -> Option<StreamEvent> {
+    if v.get("event_type")?.as_str()? != "book" {
+        return None;
+    }
+    let market_id = v.get("market")?.as_str()?.to_string();
+    let asset_id  = v.get("asset_id")?.as_str()?.to_string();
+    let timestamp_ms: u64 = v.get("timestamp")?.as_str()?.parse().ok()?;
+
+    let bids = v.get("bids")?.as_array()?;
+    let asks = v.get("asks")?.as_array()?;
+
+    let (best_bid, best_bid_size) = best_level(bids, BookSide::Bid);
+    let (best_ask, best_ask_size) = best_level(asks, BookSide::Ask);
+
+    if best_bid <= 0.0 || best_ask <= 0.0 || best_bid >= 1.0 || best_ask >= 1.0 {
+        return None;
+    }
+
+    let last_trade_price = v
+        .get("last_trade_price")
+        .and_then(|x| x.as_str())
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|p| p.is_finite() && *p > 0.0)
+        .unwrap_or(0.0);
+
+    Some(StreamEvent::ClobBook {
+        market_id,
+        asset_id,
+        best_bid,
+        best_ask,
+        best_bid_size,
+        best_ask_size,
+        last_trade_price,
+        timestamp_ms,
+    })
+}
+
+#[derive(Copy, Clone)]
+enum BookSide { Bid, Ask }
+
+/// Find the best price (max for bids, min for asks) among levels, plus the
+/// size at that price level.
+fn best_level(levels: &[serde_json::Value], side: BookSide) -> (f64, f64) {
+    let mut best_price = match side {
+        BookSide::Bid => f64::NEG_INFINITY,
+        BookSide::Ask => f64::INFINITY,
+    };
+    let mut best_size = 0.0_f64;
+    for lvl in levels {
+        let p: Option<f64> = lvl.get("price").and_then(|x| x.as_str()).and_then(|s| s.parse().ok());
+        let s: Option<f64> = lvl.get("size").and_then(|x| x.as_str()).and_then(|s| s.parse().ok());
+        if let (Some(p), Some(s)) = (p, s) {
+            if !p.is_finite() || !s.is_finite() || s <= 0.0 { continue; }
+            let better = match side {
+                BookSide::Bid => p > best_price,
+                BookSide::Ask => p < best_price,
+            };
+            if better {
+                best_price = p;
+                best_size  = s;
+            }
+        }
+    }
+    if best_price.is_finite() {
+        (best_price, best_size)
+    } else {
+        (0.0, 0.0)
+    }
+}
+
 /// Decode `latestRoundData()` ABI-encoded response.
 /// Layout (5 × 32-byte values): [roundId, answer, startedAt, updatedAt, answeredInRound]
 /// Returns (price_usd, updated_at_unix_secs).
@@ -517,6 +681,136 @@ mod tests {
     fn parse_returns_err_on_non_array_body() {
         let body = r#"{"error": "not an array"}"#;
         assert!(parse_btc_markets(body).is_err());
+    }
+
+    // ── D4: CLOB book parser ──────────────────────────────────────────────
+
+    fn sample_book_json(asset_id: &str, bids: &[(&str, &str)], asks: &[(&str, &str)]) -> String {
+        let bids_json: Vec<String> = bids.iter()
+            .map(|(p, s)| format!(r#"{{"price":"{p}","size":"{s}"}}"#))
+            .collect();
+        let asks_json: Vec<String> = asks.iter()
+            .map(|(p, s)| format!(r#"{{"price":"{p}","size":"{s}"}}"#))
+            .collect();
+        format!(
+            r#"{{
+                "event_type": "book",
+                "market": "0xabc",
+                "asset_id": "{asset_id}",
+                "timestamp": "1700000000000",
+                "hash": "deadbeef",
+                "bids": [{}],
+                "asks": [{}],
+                "tick_size": "0.01",
+                "last_trade_price": "0.49"
+            }}"#,
+            bids_json.join(","), asks_json.join(",")
+        )
+    }
+
+    #[test]
+    fn parse_book_finds_max_bid_and_min_ask() {
+        let json = sample_book_json(
+            "asset123",
+            &[("0.45","100"), ("0.46","50"), ("0.47","25")],   // best bid = 0.47
+            &[("0.50","200"), ("0.51","30"), ("0.49","10")],   // best ask = 0.49
+        );
+        let events = parse_clob_payload(&json);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            StreamEvent::ClobBook {
+                market_id, asset_id, best_bid, best_ask,
+                best_bid_size, best_ask_size, last_trade_price, ..
+            } => {
+                assert_eq!(market_id, "0xabc");
+                assert_eq!(asset_id, "asset123");
+                assert!((best_bid - 0.47).abs() < 1e-10);
+                assert!((best_ask - 0.49).abs() < 1e-10);
+                assert!((*best_bid_size - 25.0).abs() < 1e-6);
+                assert!((*best_ask_size - 10.0).abs() < 1e-6);
+                assert!((last_trade_price - 0.49).abs() < 1e-10);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn parse_book_array_emits_one_per_asset() {
+        // Two books in one CLOB message — typical at subscribe time
+        let book1 = sample_book_json("up_token",   &[("0.45","100")], &[("0.50","200")]);
+        let book2 = sample_book_json("down_token", &[("0.50","100")], &[("0.55","200")]);
+        let payload = format!("[{},{}]", book1, book2);
+        let events = parse_clob_payload(&payload);
+        assert_eq!(events.len(), 2);
+    }
+
+    #[test]
+    fn parse_book_rejects_invalid_prices() {
+        // bid > 1.0 should reject (probabilities must be in (0,1))
+        let json = sample_book_json("a", &[("1.50","100")], &[("0.50","100")]);
+        assert_eq!(parse_clob_payload(&json).len(), 0);
+    }
+
+    #[test]
+    fn parse_book_skips_non_book_event_types() {
+        let json = r#"[{"event_type":"price_change","asset_id":"x","changes":[]}]"#;
+        assert_eq!(parse_clob_payload(json).len(), 0);
+    }
+
+    #[test]
+    fn parse_book_ignores_garbage() {
+        assert_eq!(parse_clob_payload("not json").len(), 0);
+        assert_eq!(parse_clob_payload("").len(), 0);
+        assert_eq!(parse_clob_payload("[]").len(), 0);
+    }
+
+    #[test]
+    fn parse_book_skips_zero_size_levels() {
+        let json = sample_book_json(
+            "a",
+            &[("0.45","100"), ("0.50","0")],   // 0.50 has zero size — should be skipped
+            &[("0.55","100")],
+        );
+        let events = parse_clob_payload(&json);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            StreamEvent::ClobBook { best_bid, .. } => {
+                assert!((best_bid - 0.45).abs() < 1e-10, "should pick 0.45, not 0.50 (zero size)");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    // ── D4: live CLOB integration ─────────────────────────────────────────
+
+    #[ignore]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn integration_clob_live() {
+        // Pull a live BTC market from Gamma, then subscribe to its CLOB tokens
+        let markets = discover_btc_markets().await.expect("gamma");
+        assert!(!markets.is_empty(), "need a live BTC market");
+        let m = &markets[0];
+        let asset_ids = vec![m.up_token_id.clone(), m.down_token_id.clone()];
+
+        let (tx, mut rx) = broadcast::channel::<StreamEvent>(64);
+        tokio::spawn(clob_stream(tx, asset_ids));
+
+        let event = tokio::time::timeout(Duration::from_secs(15), rx.recv())
+            .await
+            .expect("timed out waiting for CLOB book event")
+            .expect("recv");
+
+        match event {
+            StreamEvent::ClobBook { best_bid, best_ask, market_id, asset_id, .. } => {
+                assert!(best_bid > 0.0 && best_bid < 1.0, "bid: {best_bid}");
+                assert!(best_ask > 0.0 && best_ask < 1.0, "ask: {best_ask}");
+                assert!(best_ask >= best_bid, "ask {best_ask} should be >= bid {best_bid}");
+                assert!(!market_id.is_empty());
+                assert!(!asset_id.is_empty());
+                tracing::info!(market_id, asset_id, best_bid, best_ask, "CLOB OK");
+            }
+            _ => panic!("wrong variant"),
+        }
     }
 
     // ── D2: Chainlink decoder unit tests ──────────────────────────────────
