@@ -1,5 +1,6 @@
 pub mod binance;
 pub mod liquidations;
+pub mod poly_user;
 pub mod polymarket;
 
 /// Central event type broadcast to all consumers.

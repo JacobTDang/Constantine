@@ -5,4 +5,5 @@ pub mod kelly;
 pub mod orders;
 pub mod presign;
 pub mod runner;
+pub mod slippage;
 pub mod window_watcher;

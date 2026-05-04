@@ -21,11 +21,12 @@ use std::sync::Arc;
 use crate::execution::clob::ClobClient;
 use crate::execution::kelly::kelly_size;
 use crate::execution::orders::{
-    private_key_to_address, u256_from_dec, Domain, SignatureType, Side,
+    private_key_to_address, u256_from_dec, Domain, SignatureType, Side, SignedOrder,
 };
 use crate::execution::presign::{OrderPool, PoolKey, PopulateParams};
 use crate::features::FeatureState;
 use crate::risk::limits::{RiskConfig, RiskLimits};
+use crate::signals::intramarket::IntramarketArbSignal;
 use crate::signals::{Direction, SignalDecision};
 use crate::storage::PositionStore;
 use crate::streams::polymarket::PolyMarket;
@@ -91,6 +92,12 @@ pub async fn execute_signal(
     decision: &SignalDecision,
     ctx:      &ExecContext<'_>,
 ) -> ExecOutcome {
+    // C2: intramarket = both legs concurrently. Different lifecycle from
+    // single-leg oracle, dispatched separately.
+    if let SignalDecision::Intramarket(s) = decision {
+        return execute_intramarket(s, ctx).await;
+    }
+
     // 1. Resolve which token + price + p_win we'd buy.
     let target = match resolve_target(decision, ctx.state, ctx.markets, ctx.target_market_id) {
         Ok(t)  => t,
@@ -245,6 +252,194 @@ fn local_order_id(salt: &[u8; 32]) -> String {
     format!("local-{:016x}", u64::from_be_bytes(buf))
 }
 
+// ── C2: Multi-leg intramarket arb ───────────────────────────────────────────
+
+/// Execute an intramarket arb by submitting both YES and NO BUY orders
+/// concurrently. Returns Submitted only when BOTH legs accepted; otherwise
+/// Errored with details about which leg failed.
+///
+/// Concurrency: tokio::join! dispatches both submits in parallel — same
+/// thread, two simultaneous in-flight HTTP requests. Total wall-time is
+/// max(yes_latency, no_latency), not the sum.
+///
+/// Risk gate: total bet = yes_bet + no_bet, checked once against
+/// can_trade BEFORE either leg is submitted.
+pub async fn execute_intramarket(
+    sig: &IntramarketArbSignal,
+    ctx: &ExecContext<'_>,
+) -> ExecOutcome {
+    // 1. Resolve market — uses target_market_id like the oracle path
+    let market_id = match ctx.target_market_id
+        .map(|s| s.to_string())
+        .or_else(|| ctx.state.primary_market_id.clone())
+    {
+        Some(id) => id,
+        None => return ExecOutcome::Skipped {
+            reason: "no market specified for intramarket".into(),
+        },
+    };
+    let market = match ctx.markets.iter().find(|m| m.id == market_id) {
+        Some(m) => m,
+        None => return ExecOutcome::Skipped {
+            reason: format!("market {market_id} not in market list"),
+        },
+    };
+
+    // 2. Sizing — split bet equally across legs. Per-leg bet caps at
+    // max_bet/2 so combined exposure equals max_bet (parity with oracle path).
+    let per_leg_bet = (ctx.risk_cfg.max_bet_dollars * 0.5).max(0.01);
+    let total_bet   = per_leg_bet * 2.0;
+
+    // 3. Risk gate on COMBINED exposure
+    if let Err(e) = ctx.risk.can_trade(total_bet, ctx.risk_cfg) {
+        return ExecOutcome::Skipped { reason: format!("risk: {e}") };
+    }
+
+    // 4. Look up both pre-signed orders
+    let yes_asset = match u256_from_dec(&market.up_token_id) {
+        Ok(id) => id,
+        Err(e) => return ExecOutcome::Skipped {
+            reason: format!("yes token id parse: {e}"),
+        },
+    };
+    let no_asset = match u256_from_dec(&market.down_token_id) {
+        Ok(id) => id,
+        Err(e) => return ExecOutcome::Skipped {
+            reason: format!("no token id parse: {e}"),
+        },
+    };
+    let yes_cents = price_to_cents(sig.yes_ask);
+    let no_cents  = price_to_cents(sig.no_ask);
+    let yes_key = PoolKey { asset_id: yes_asset, side: Side::Buy, price_cents: yes_cents };
+    let no_key  = PoolKey { asset_id: no_asset,  side: Side::Buy, price_cents: no_cents  };
+
+    let yes_signed = match ctx.pool.take(&yes_key) {
+        Some(s) => s,
+        None => return ExecOutcome::Skipped {
+            reason: format!("no pre-signed YES order at {yes_cents}c"),
+        },
+    };
+    let no_signed = match ctx.pool.take(&no_key) {
+        Some(s) => s,
+        None => {
+            // CRITICAL: we already consumed the yes slot. Putting it back is
+            // not safe (salts are one-shot in design), so we log and skip.
+            tracing::warn!(
+                "intramarket aborted: NO leg pool miss after YES leg taken \
+                 — YES slot at {}c is now unused (salt won't be reused)",
+                yes_cents,
+            );
+            return ExecOutcome::Skipped {
+                reason: format!("no pre-signed NO order at {no_cents}c (yes slot wasted)"),
+            };
+        }
+    };
+
+    // 5. Concurrent submit — tokio::join runs both HTTP calls in parallel
+    let (yes_res, no_res) = tokio::join!(
+        ctx.client.submit_order(&yes_signed),
+        ctx.client.submit_order(&no_signed),
+    );
+
+    // 6. Record both legs to the position ledger and risk module
+    let yes_outcome = handle_leg_result(
+        ctx, &yes_signed, "yes", per_leg_bet, sig.yes_ask, yes_res,
+    );
+    let no_outcome = handle_leg_result(
+        ctx, &no_signed,  "no",  per_leg_bet, sig.no_ask,  no_res,
+    );
+
+    // 7. Summarise — both must succeed for a clean arb
+    match (&yes_outcome, &no_outcome) {
+        (LegResult::Submitted { .. }, LegResult::Submitted { dry_run, .. }) => {
+            tracing::info!(
+                yes_price = sig.yes_ask, no_price = sig.no_ask,
+                yes_bet   = per_leg_bet, no_bet   = per_leg_bet,
+                net_profit = sig.net_profit,
+                "INTRAMARKET ARB EXECUTED — both legs submitted"
+            );
+            ExecOutcome::Submitted {
+                bet_dollars: total_bet,
+                price:       sig.yes_ask + sig.no_ask,   // combined cost
+                side:        SideLabel::Yes,             // arbitrary — both sides bought
+                order_id:    "intramarket".to_string(),
+                dry_run:     *dry_run,
+                attempts:    1,
+            }
+        }
+        _ => {
+            tracing::error!(
+                yes = ?yes_outcome, no = ?no_outcome,
+                "INTRAMARKET PARTIAL/FAILED — directional exposure may exist"
+            );
+            ExecOutcome::Errored {
+                error: format!(
+                    "intramarket partial: yes={:?} no={:?}",
+                    yes_outcome, no_outcome
+                ),
+            }
+        }
+    }
+}
+
+// Fields are intentional — used by Debug formatting in the
+// "intramarket partial" error string. Suppress the dead-code lint.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+enum LegResult {
+    Submitted { dry_run: bool, order_id: String },
+    Rejected  { reason:  String },
+    Errored   { error:   String },
+}
+
+fn handle_leg_result(
+    ctx:      &ExecContext<'_>,
+    signed:   &SignedOrder,
+    side_str: &str,
+    bet:      f64,
+    price:    f64,
+    res:      anyhow::Result<crate::execution::clob::SubmitOutcome>,
+) -> LegResult {
+    let outcome = match res {
+        Ok(o)  => o,
+        Err(e) => {
+            if let Some(positions) = ctx.positions {
+                let local_id = local_order_id(&signed.order.salt);
+                let _ = positions.record_fail(&local_id, format!("transport: {e}"));
+            }
+            return LegResult::Errored { error: e.to_string() };
+        }
+    };
+    if !outcome.success {
+        if let Some(positions) = ctx.positions {
+            let local_id = local_order_id(&signed.order.salt);
+            let _ = positions.record_fail(&local_id, &outcome.error_msg);
+        }
+        return LegResult::Rejected { reason: outcome.error_msg };
+    }
+
+    // Success — record_open and (if real) record_open in risk
+    if !outcome.dry_run {
+        ctx.risk.record_open(bet);
+    }
+    if let Some(positions) = ctx.positions {
+        let order_id = if outcome.order_id.is_empty() {
+            local_order_id(&signed.order.salt)
+        } else {
+            outcome.order_id.clone()
+        };
+        let market_id = ctx.target_market_id
+            .map(|s| s.to_string())
+            .or_else(|| ctx.state.primary_market_id.clone())
+            .unwrap_or_default();
+        let _ = positions.record_open(&order_id, market_id, side_str, bet, price);
+    }
+    LegResult::Submitted {
+        dry_run:  outcome.dry_run,
+        order_id: outcome.order_id,
+    }
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 struct Target {
@@ -263,9 +458,9 @@ fn resolve_target(
     let oracle = match decision {
         SignalDecision::None              => return Err("no signal".to_string()),
         SignalDecision::Intramarket(_)    => {
-            // Multi-leg execution lands in Sprint 4. Single-shot oracle path
-            // for now.
-            return Err("intramarket multi-leg not yet supported".to_string());
+            // Intramarket is dispatched by execute_intramarket BEFORE
+            // resolve_target is called — should never reach here.
+            return Err("BUG: intramarket reached resolve_target — execute_intramarket should have caught it".to_string());
         }
         SignalDecision::Oracle(s) => s,
     };
@@ -1174,6 +1369,126 @@ mod tests {
         // Submitted because the pool is populated for the OTHER market
         assert!(matches!(outcome, ExecOutcome::Submitted { .. }),
             "target_market_id should route to other market — got {outcome:?}");
+    }
+
+    // ── C2: Multi-leg intramarket ──────────────────────────────────────────
+
+    fn intramarket_signal(yes: f64, no: f64) -> SignalDecision {
+        SignalDecision::Intramarket(IntramarketArbSignal {
+            yes_ask: yes, no_ask: no,
+            gross_total: yes + no, gross_profit: 1.0 - (yes + no),
+            net_profit: 1.0 - (yes + no) - (yes + no) * 0.018,
+            total_fees: (yes + no) * 0.018,
+        })
+    }
+
+    #[tokio::test]
+    async fn intramarket_submits_both_legs() {
+        let pool = OrderPool::new();
+        // Pre-sign for BOTH up and down tokens
+        populate_pool_for_market(&pool, UP_TOKEN_ID);
+        populate_pool_for_market(&pool, DOWN_TOKEN_ID);
+        let pool_size_before = pool.len();
+
+        let positions = temp_positions();
+        let risk    = RiskLimits::new();
+        let cfg     = RiskConfig::default();
+        let client  = make_client_dry_run();
+        let state   = sample_state();
+        let markets = vec![sample_market()];
+        let ctx = ExecContext {
+            state: &state, markets: &markets,
+            risk: &risk, risk_cfg: &cfg,
+            pool: &pool, client: &client,
+            positions: Some(&positions),
+            target_market_id: None,
+        };
+
+        let dec = intramarket_signal(0.40, 0.42);   // yes 40c, no 42c
+        let outcome = execute_signal(&dec, &ctx).await;
+        match outcome {
+            ExecOutcome::Submitted { order_id, .. } => {
+                assert_eq!(order_id, "intramarket");
+            }
+            other => panic!("expected Submitted, got {other:?}"),
+        }
+        // Both pool slots consumed
+        assert_eq!(pool.len(), pool_size_before - 2);
+        // Both legs recorded
+        assert_eq!(positions.len(), 2);
+        let all = positions.all();
+        let sides: std::collections::HashSet<&str> =
+            all.iter().map(|p| p.side.as_str()).collect();
+        assert!(sides.contains("yes"));
+        assert!(sides.contains("no"));
+    }
+
+    #[tokio::test]
+    async fn intramarket_skipped_when_only_yes_pre_signed() {
+        // YES pre-signed, NO is missing — must abort cleanly. The yes slot
+        // gets consumed because we take it before checking no (race-safe
+        // pattern in production where the take is atomic).
+        let pool = OrderPool::new();
+        populate_pool_for_market(&pool, UP_TOKEN_ID);
+
+        let positions = temp_positions();
+        let risk    = RiskLimits::new();
+        let cfg     = RiskConfig::default();
+        let client  = make_client_dry_run();
+        let state   = sample_state();
+        let markets = vec![sample_market()];
+        let ctx = ExecContext {
+            state: &state, markets: &markets,
+            risk: &risk, risk_cfg: &cfg,
+            pool: &pool, client: &client,
+            positions: Some(&positions),
+            target_market_id: None,
+        };
+
+        let dec = intramarket_signal(0.40, 0.42);
+        let outcome = execute_signal(&dec, &ctx).await;
+        match outcome {
+            ExecOutcome::Skipped { reason } => {
+                assert!(reason.contains("NO order"), "reason was: {reason}");
+            }
+            other => panic!("expected Skipped, got {other:?}"),
+        }
+        // Risk gate cleared, but no positions recorded (NO leg never submitted,
+        // YES leg pool slot was consumed but submit never happened)
+        assert_eq!(positions.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn intramarket_skipped_on_kill_switch_before_taking_pool() {
+        let pool = OrderPool::new();
+        populate_pool_for_market(&pool, UP_TOKEN_ID);
+        populate_pool_for_market(&pool, DOWN_TOKEN_ID);
+        let pool_size_before = pool.len();
+
+        let risk = RiskLimits::new();
+        risk.activate_kill_switch();   // pre-trip
+        let positions = temp_positions();
+        let cfg     = RiskConfig::default();
+        let client  = make_client_dry_run();
+        let state   = sample_state();
+        let markets = vec![sample_market()];
+        let ctx = ExecContext {
+            state: &state, markets: &markets,
+            risk: &risk, risk_cfg: &cfg,
+            pool: &pool, client: &client,
+            positions: Some(&positions),
+            target_market_id: None,
+        };
+
+        let dec = intramarket_signal(0.40, 0.42);
+        let outcome = execute_signal(&dec, &ctx).await;
+        match outcome {
+            ExecOutcome::Skipped { reason } => assert!(reason.contains("kill switch")),
+            other => panic!("expected Skipped, got {other:?}"),
+        }
+        // Pool MUST be untouched — kill switch fires before pool.take
+        assert_eq!(pool.len(), pool_size_before);
+        assert_eq!(positions.len(), 0);
     }
 
     #[test]
