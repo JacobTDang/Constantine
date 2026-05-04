@@ -17,8 +17,10 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{broadcast, RwLock};
 use tokio::time::Duration;
+
+use super::StreamEvent;
 
 const GAMMA_URL: &str =
     "https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=100&order=startDate&ascending=false";
@@ -214,6 +216,104 @@ pub async fn discover_btc_markets_or_err() -> Result<Vec<PolyMarket>> {
         return Err(anyhow!("no BTC Up-or-Down markets currently active"));
     }
     Ok(markets)
+}
+
+// ── D2: Chainlink BTC/USD on-chain polling ───────────────────────────────────
+//
+// Replaces the original Polymarket RTDS WebSocket plan — the RTDS endpoint
+// stopped emitting reliable updates after the initial snapshot.
+//
+// Chainlink BTC/USD aggregator on Polygon mainnet is the same on-chain feed
+// that Polymarket uses for resolution. Polling it directly is more reliable
+// and authoritative, with no API keys required (free public RPCs work).
+
+const CHAINLINK_BTC_USD_POLYGON:    &str = "0xc907E116054Ad103354f2D350FD2514433D57F6f";
+const LATEST_ROUND_DATA_SELECTOR:   &str = "0xfeaf968c"; // latestRoundData()
+const CHAINLINK_POLL_INTERVAL_SECS: u64  = 5;
+
+const POLYGON_RPC_URLS: &[&str] = &[
+    "https://polygon-bor-rpc.publicnode.com",
+    "https://polygon.drpc.org",
+    "https://1rpc.io/matic",
+];
+
+/// Background task: poll Chainlink BTC/USD every 5s, emit ChainlinkPrice event.
+/// Rotates through public RPC endpoints on failure.
+pub async fn chainlink_polling_loop(tx: broadcast::Sender<StreamEvent>) {
+    let mut url_idx = 0usize;
+    loop {
+        let url = POLYGON_RPC_URLS[url_idx % POLYGON_RPC_URLS.len()];
+        match fetch_chainlink_btc(url).await {
+            Ok(event) => {
+                if let StreamEvent::ChainlinkPrice { price, .. } = &event {
+                    tracing::debug!(rpc = url, btc_usd = price, "chainlink update");
+                }
+                let _ = tx.send(event);
+            }
+            Err(e) => {
+                tracing::warn!(rpc = url, error = %e, "chainlink poll failed, rotating RPC");
+                url_idx = url_idx.wrapping_add(1);
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(CHAINLINK_POLL_INTERVAL_SECS)).await;
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct JsonRpcResp {
+    result: Option<String>,
+    error:  Option<serde_json::Value>,
+}
+
+async fn fetch_chainlink_btc(rpc_url: &str) -> Result<StreamEvent> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()?;
+
+    let req = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method":  "eth_call",
+        "params":  [
+            {"to": CHAINLINK_BTC_USD_POLYGON, "data": LATEST_ROUND_DATA_SELECTOR},
+            "latest"
+        ],
+        "id": 1
+    });
+
+    let resp: JsonRpcResp = client.post(rpc_url).json(&req).send().await?.json().await?;
+
+    if let Some(err) = resp.error {
+        return Err(anyhow!("rpc error: {err}"));
+    }
+    let result = resp.result.ok_or_else(|| anyhow!("rpc response missing result"))?;
+    let (price, ts_secs) = decode_latest_round_data(&result)
+        .ok_or_else(|| anyhow!("failed to decode chainlink response: {result}"))?;
+
+    Ok(StreamEvent::ChainlinkPrice {
+        price,
+        timestamp_ms: ts_secs * 1000,
+    })
+}
+
+/// Decode `latestRoundData()` ABI-encoded response.
+/// Layout (5 × 32-byte values): [roundId, answer, startedAt, updatedAt, answeredInRound]
+/// Returns (price_usd, updated_at_unix_secs).
+fn decode_latest_round_data(hex_result: &str) -> Option<(f64, u64)> {
+    let hex = hex_result.strip_prefix("0x").unwrap_or(hex_result);
+    if hex.len() < 256 {
+        return None;
+    }
+    // answer is the second 32-byte chunk
+    let answer = u128::from_str_radix(&hex[64..128], 16).ok()?;
+    // updatedAt is the fourth 32-byte chunk
+    let updated_at = u64::from_str_radix(&hex[192..256], 16).ok()?;
+
+    // Polygon BTC/USD feed: 8 decimals
+    let price = answer as f64 / 1e8;
+    if !price.is_finite() || price <= 0.0 {
+        return None;
+    }
+    Some((price, updated_at))
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -419,9 +519,80 @@ mod tests {
         assert!(parse_btc_markets(body).is_err());
     }
 
-    // ── Live integration test ─────────────────────────────────────────────
-    // Hits the real Gamma API. Requires internet.
-    // cargo test integration_discover_btc -- --ignored --nocapture
+    // ── D2: Chainlink decoder unit tests ──────────────────────────────────
+
+    #[test]
+    fn decode_chainlink_response_known_value() {
+        // BTC/USD ~ $80,185.16 with answer = 8018516000000 (8 decimals = e8)
+        // updatedAt = 1777864914 (unix sec)
+        // Layout 5×32 bytes. Hex below has roundId=0, answer, 0, updatedAt, 0.
+        let answer_hex = format!("{:064x}", 8_018_516_000_000_u128);
+        let updated_hex = format!("{:064x}", 1_777_864_914_u64);
+        let zero64      = "0".repeat(64);
+        let hex = format!("0x{}{}{}{}{}", zero64, answer_hex, zero64, updated_hex, zero64);
+        let (price, ts) = decode_latest_round_data(&hex).expect("decode");
+        assert!((price - 80_185.16).abs() < 0.01);
+        assert_eq!(ts, 1_777_864_914);
+    }
+
+    #[test]
+    fn decode_chainlink_too_short_returns_none() {
+        assert!(decode_latest_round_data("0xdeadbeef").is_none());
+        assert!(decode_latest_round_data("").is_none());
+    }
+
+    #[test]
+    fn decode_chainlink_zero_price_returns_none() {
+        let zero64 = "0".repeat(64);
+        let hex = format!("0x{}", zero64.repeat(5));
+        assert!(decode_latest_round_data(&hex).is_none());
+    }
+
+    #[test]
+    fn decode_chainlink_strips_0x_prefix() {
+        let answer_hex = format!("{:064x}", 5_000_000_000_000_u128); // $50,000
+        let updated   = format!("{:064x}", 1_700_000_000_u64);
+        let zero64    = "0".repeat(64);
+        let with_prefix    = format!("0x{}{}{}{}{}", zero64, answer_hex, zero64, updated, zero64);
+        let without_prefix =          format!("{}{}{}{}{}", zero64, answer_hex, zero64, updated, zero64);
+        assert_eq!(decode_latest_round_data(&with_prefix),
+                   decode_latest_round_data(&without_prefix));
+    }
+
+    // ── D2: live chainlink polling integration ────────────────────────────
+
+    #[ignore]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn integration_chainlink_btc_live() {
+        let event = fetch_chainlink_btc(POLYGON_RPC_URLS[0])
+            .await
+            .expect("chainlink fetch");
+        match event {
+            StreamEvent::ChainlinkPrice { price, timestamp_ms } => {
+                // Sanity bounds — BTC has been between $1k and $1M for years
+                assert!(price > 1_000.0  && price < 1_000_000.0, "absurd price: {price}");
+                assert!(timestamp_ms > 1_700_000_000_000, "timestamp from a real round");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[ignore]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn integration_chainlink_polling_loop_emits() {
+        let (tx, mut rx) = broadcast::channel::<StreamEvent>(64);
+        tokio::spawn(chainlink_polling_loop(tx));
+        let event = tokio::time::timeout(Duration::from_secs(15), rx.recv())
+            .await
+            .expect("timed out waiting for chainlink event")
+            .expect("recv");
+        match event {
+            StreamEvent::ChainlinkPrice { price, .. } => assert!(price > 1_000.0),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    // ── D1: Live Gamma integration ────────────────────────────────────────
 
     #[ignore]
     #[tokio::test(flavor = "multi_thread")]

@@ -41,10 +41,11 @@ async fn main() -> anyhow::Result<()> {
     // Feature compute loop (C11)
     tasks.spawn(features::compute_loop(tx.subscribe(), state.clone()));
 
-    // Polymarket market discovery (D1)
+    // Polymarket market discovery (D1) + Chainlink BTC/USD polling (D2)
     tasks.spawn(streams::polymarket::market_discovery_loop(markets.clone()));
+    tasks.spawn(streams::polymarket::chainlink_polling_loop(tx.clone()));
 
-    tracing::info!("all tasks started — streams + features + market discovery active");
+    tracing::info!("all tasks started — streams + features + market discovery + chainlink");
 
     // Signal, execution, IPC tasks join in later phases.
     tasks.join_all().await;
