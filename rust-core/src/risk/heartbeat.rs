@@ -26,6 +26,9 @@ pub struct HeartbeatSnapshot {
     pub primary_market:       Option<String>,
     pub time_to_close_secs:   f64,
     pub kill_switch_active:   bool,
+    pub data_stale:           bool,                // G11
+    pub realised_pnl_dollars: f64,                 // G7
+    pub current_bankroll_usd: f64,                 // G7
     pub daily_loss_dollars:   f64,
     pub weekly_loss_dollars:  f64,
     pub open_exposure_usd:    f64,
@@ -35,35 +38,41 @@ pub struct HeartbeatSnapshot {
 }
 
 /// Compose one heartbeat snapshot. Public so tests can drive it without
-/// running the loop.
+/// running the loop. Caller passes `starting_bankroll` so the snapshot's
+/// `current_bankroll_usd` reflects the compounded value.
 pub fn snapshot(
-    state:     &FeatureState,
-    risk:      &RiskLimits,
-    positions: &PositionStore,
-    now_ms:    u64,
+    state:             &FeatureState,
+    risk:              &RiskLimits,
+    positions:         &PositionStore,
+    starting_bankroll: f64,
+    now_ms:            u64,
 ) -> HeartbeatSnapshot {
     HeartbeatSnapshot {
         now_ms,
-        seq:                 state.seq,
-        spot_price:          state.spot_price,
-        primary_market:      state.primary_market_id.clone(),
-        time_to_close_secs:  state.time_to_close,
-        kill_switch_active:  risk.is_kill_switch_active(),
-        daily_loss_dollars:  risk.daily_loss_dollars(),
-        weekly_loss_dollars: risk.weekly_loss_dollars(),
-        open_exposure_usd:   risk.open_exposure_dollars(),
-        daily_trade_count:   risk.daily_trade_count(),
-        positions_total:     positions.len(),
-        positions_pending:   positions.pending_settlement().len(),
+        seq:                  state.seq,
+        spot_price:           state.spot_price,
+        primary_market:       state.primary_market_id.clone(),
+        time_to_close_secs:   state.time_to_close,
+        kill_switch_active:   risk.is_kill_switch_active(),
+        data_stale:           risk.is_data_stale(),
+        realised_pnl_dollars: risk.realised_pnl_dollars(),
+        current_bankroll_usd: risk.current_bankroll(starting_bankroll),
+        daily_loss_dollars:   risk.daily_loss_dollars(),
+        weekly_loss_dollars:  risk.weekly_loss_dollars(),
+        open_exposure_usd:    risk.open_exposure_dollars(),
+        daily_trade_count:    risk.daily_trade_count(),
+        positions_total:      positions.len(),
+        positions_pending:    positions.pending_settlement().len(),
     }
 }
 
 /// Long-running task: emit a "HB" log line every N seconds.
 pub async fn heartbeat_loop(
-    state:     Arc<RwLock<FeatureState>>,
-    risk:      Arc<RiskLimits>,
-    positions: Arc<PositionStore>,
-    interval_secs: u64,
+    state:             Arc<RwLock<FeatureState>>,
+    risk:              Arc<RiskLimits>,
+    positions:         Arc<PositionStore>,
+    starting_bankroll: f64,
+    interval_secs:     u64,
 ) {
     let secs = if interval_secs == 0 { DEFAULT_HEARTBEAT_SECS } else { interval_secs };
     let mut tick = tokio::time::interval(Duration::from_secs(secs));
@@ -75,7 +84,7 @@ pub async fn heartbeat_loop(
         let now_ms = chrono::Utc::now().timestamp_millis() as u64;
         let snap = {
             let s = state.read().await;
-            snapshot(&s, &risk, &positions, now_ms)
+            snapshot(&s, &risk, &positions, starting_bankroll, now_ms)
         };
 
         tracing::info!(
@@ -85,6 +94,9 @@ pub async fn heartbeat_loop(
             primary       = ?snap.primary_market,
             t_close_s     = snap.time_to_close_secs,
             kill          = snap.kill_switch_active,
+            data_stale    = snap.data_stale,
+            realised_pnl  = snap.realised_pnl_dollars,
+            bankroll      = snap.current_bankroll_usd,
             daily_loss    = snap.daily_loss_dollars,
             weekly_loss   = snap.weekly_loss_dollars,
             exposure_usd  = snap.open_exposure_usd,
@@ -126,7 +138,7 @@ mod tests {
         let store = PositionStore::open(&temp_dir()).unwrap();
         store.record_open("a", "btc-1", "yes", 5.0, 0.45).unwrap();
 
-        let snap = snapshot(&s, &risk, &store, 1_000_000);
+        let snap = snapshot(&s, &risk, &store, 1500.0, 1_000_000);
         assert_eq!(snap.seq, 42);
         assert!((snap.spot_price - 80_500.0).abs() < 1e-9);
         assert_eq!(snap.primary_market.as_deref(), Some("btc-1"));
@@ -142,10 +154,10 @@ mod tests {
         let s = FeatureState::default();
         let risk = RiskLimits::new();
         let store = PositionStore::open(&temp_dir()).unwrap();
-        let snap = snapshot(&s, &risk, &store, 0);
+        let snap = snapshot(&s, &risk, &store, 1500.0, 0);
         assert!(!snap.kill_switch_active);
         risk.activate_kill_switch();
-        let snap2 = snapshot(&s, &risk, &store, 0);
+        let snap2 = snapshot(&s, &risk, &store, 1500.0, 0);
         assert!(snap2.kill_switch_active);
     }
 
@@ -157,7 +169,7 @@ mod tests {
         store.record_open("a", "m", "yes", 5.0, 0.45).unwrap();
         store.record_open("b", "m", "yes", 5.0, 0.50).unwrap();
         store.record_settle("a", true, 1.0).unwrap();   // settled
-        let snap = snapshot(&s, &risk, &store, 0);
+        let snap = snapshot(&s, &risk, &store, 1500.0, 0);
         assert_eq!(snap.positions_total, 2);
         assert_eq!(snap.positions_pending, 1);   // only b is pending
     }
@@ -168,7 +180,7 @@ mod tests {
         let state = Arc::new(RwLock::new(FeatureState::default()));
         let risk  = Arc::new(RiskLimits::new());
         let store = Arc::new(PositionStore::open(&temp_dir()).unwrap());
-        let h = tokio::spawn(heartbeat_loop(state, risk, store, 1));
+        let h = tokio::spawn(heartbeat_loop(state, risk, store, 1500.0, 1));
         tokio::time::sleep(Duration::from_secs(2)).await;
         h.abort();
         // No assertion — if we got here without a panic, we're good.

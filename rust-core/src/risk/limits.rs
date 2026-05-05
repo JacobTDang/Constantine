@@ -53,6 +53,9 @@ pub enum RiskError {
     #[error("kill switch active — manual reset required")]
     KillSwitchActive,
 
+    #[error("data stale — waiting for stream recovery")]
+    DataStale,
+
     #[error("daily loss limit hit: ${current:.2} >= ${limit:.2}")]
     DailyLossLimitHit { current: f64, limit: f64 },
 
@@ -83,6 +86,15 @@ pub struct RiskLimits {
     daily_trade_count:    AtomicU32,
     /// Sticky once tripped — only manual reset clears
     kill_switch:          AtomicBool,
+    /// G11: transient halt for stale-data scenarios. Auto-clears when the
+    /// watchdog sees streams recover. Distinct from kill_switch (which
+    /// represents a real failure that needs human review).
+    data_stale:           AtomicBool,
+    /// G7: net realised P&L in cents (signed — gains add, losses subtract).
+    /// Used by current_bankroll() to compound Kelly sizing with results.
+    /// Distinct from daily_loss_cents/weekly_loss_cents (those track losses
+    /// only, used for limit enforcement). Never resets on day/week boundary.
+    realised_pnl_cents:   AtomicI64,
     /// UTC midnight of last daily counter reset (ms since epoch)
     last_daily_reset_ms:  AtomicU64,
     /// Start of last weekly counter reset (ms since epoch)
@@ -103,6 +115,8 @@ impl RiskLimits {
             open_exposure_cents:  AtomicI64::new(0),
             daily_trade_count:    AtomicU32::new(0),
             kill_switch:          AtomicBool::new(false),
+            data_stale:           AtomicBool::new(false),
+            realised_pnl_cents:   AtomicI64::new(0),
             last_daily_reset_ms:  AtomicU64::new(0),
             last_weekly_reset_ms: AtomicU64::new(0),
         }
@@ -133,6 +147,12 @@ impl RiskLimits {
         // Order matters: kill switch first (cheapest, most decisive)
         if self.kill_switch.load(Ordering::SeqCst) {
             return Err(RiskError::KillSwitchActive);
+        }
+        // G11: data-stale halt is a transient gate (auto-clears on recovery).
+        // Distinct from kill_switch — won't survive watchdog observing fresh
+        // streams again.
+        if self.data_stale.load(Ordering::SeqCst) {
+            return Err(RiskError::DataStale);
         }
 
         let daily_loss = self.daily_loss_dollars();
@@ -197,6 +217,14 @@ impl RiskLimits {
             }
         }
 
+        // G7: track signed realised P&L for current_bankroll() / kelly compounding.
+        // Updated on EVERY finite pnl (gains AND losses), independent of the
+        // loss-only counters used for daily/weekly limit enforcement below.
+        if pnl_dollars.is_finite() {
+            let pnl_cents = (pnl_dollars * 100.0).round() as i64;
+            self.realised_pnl_cents.fetch_add(pnl_cents, Ordering::SeqCst);
+        }
+
         if pnl_dollars.is_finite() && pnl_dollars < 0.0 {
             let loss_cents = (-pnl_dollars * 100.0).round() as i64;
             self.daily_loss_cents.fetch_add(loss_cents, Ordering::SeqCst);
@@ -246,6 +274,31 @@ impl RiskLimits {
 
     pub fn daily_trade_count(&self) -> u32 {
         self.daily_trade_count.load(Ordering::SeqCst)
+    }
+
+    // ── G7: dynamic bankroll ──────────────────────────────────────────────
+
+    /// Net realised P&L (in dollars). Positive on net gains, negative on
+    /// net losses. Never resets — accumulates across day/week boundaries.
+    pub fn realised_pnl_dollars(&self) -> f64 {
+        self.realised_pnl_cents.load(Ordering::SeqCst) as f64 / 100.0
+    }
+
+    /// Current bankroll = `starting + realised_pnl`, floored at 0 to keep
+    /// kelly_size from doing negative-bankroll math. Read by execute_signal
+    /// each tick so kelly compounds with results.
+    pub fn current_bankroll(&self, starting_bankroll: f64) -> f64 {
+        (starting_bankroll + self.realised_pnl_dollars()).max(0.0)
+    }
+
+    // ── G11: data-stale flag (auto-reset by the watchdog) ─────────────────
+
+    pub fn set_data_stale(&self, stale: bool) {
+        self.data_stale.store(stale, Ordering::SeqCst);
+    }
+
+    pub fn is_data_stale(&self) -> bool {
+        self.data_stale.load(Ordering::SeqCst)
     }
 
     // ── Resets (lazy, called from can_trade) ──────────────────────────────
@@ -317,6 +370,76 @@ mod tests {
         assert_eq!(r.open_exposure_dollars(), 0.0);
         assert_eq!(r.daily_trade_count(), 0);
         assert!(!r.is_kill_switch_active());
+        // G7
+        assert_eq!(r.realised_pnl_dollars(), 0.0);
+        assert_eq!(r.current_bankroll(1500.0), 1500.0);
+        // G11
+        assert!(!r.is_data_stale());
+    }
+
+    // ── G7: dynamic bankroll ──────────────────────────────────────────────
+
+    #[test]
+    fn realised_pnl_accumulates_signed_across_record_close() {
+        let r = RiskLimits::new();
+        r.record_close(20.0,  5.0, &cfg());   // +$5 win
+        r.record_close(20.0, -8.0, &cfg());   // -$8 loss
+        r.record_close(20.0,  3.0, &cfg());   // +$3 win
+        // Net: +5 - 8 + 3 = $0
+        assert!((r.realised_pnl_dollars() - 0.0).abs() < 1e-6);
+        // But losses-only counter still holds the $8
+        assert!((r.daily_loss_dollars() - 8.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn current_bankroll_compounds_with_pnl() {
+        let r = RiskLimits::new();
+        assert_eq!(r.current_bankroll(1500.0), 1500.0);
+        r.record_close(20.0, -100.0, &cfg());
+        r.reset_kill_switch();   // loss tripped it; reset for the test
+        assert!((r.current_bankroll(1500.0) - 1400.0).abs() < 1e-6);
+        r.record_close(20.0, 250.0, &cfg());
+        assert!((r.current_bankroll(1500.0) - 1650.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn current_bankroll_floors_at_zero() {
+        let r = RiskLimits::new();
+        // Catastrophic loss > starting bankroll
+        r.record_close(20.0, -2000.0, &cfg());
+        assert_eq!(r.current_bankroll(1500.0), 0.0);
+    }
+
+    #[test]
+    fn realised_pnl_ignores_non_finite() {
+        let r = RiskLimits::new();
+        r.record_close(20.0, f64::NAN,         &cfg());
+        r.record_close(20.0, f64::INFINITY,    &cfg());
+        r.record_close(20.0, f64::NEG_INFINITY, &cfg());
+        assert_eq!(r.realised_pnl_dollars(), 0.0);
+    }
+
+    // ── G11: data_stale flag ──────────────────────────────────────────────
+
+    #[test]
+    fn data_stale_blocks_can_trade() {
+        let r = RiskLimits::new();
+        r.set_data_stale(true);
+        let err = r.can_trade_at(20.0, 1_700_000_000_000, &cfg()).unwrap_err();
+        assert_eq!(err, RiskError::DataStale);
+    }
+
+    #[test]
+    fn data_stale_clears_independently_of_kill_switch() {
+        let r = RiskLimits::new();
+        r.activate_kill_switch();
+        r.set_data_stale(true);
+        // Clear data_stale — kill switch must remain tripped
+        r.set_data_stale(false);
+        assert!(r.is_kill_switch_active());
+        // can_trade still blocks (kill switch reason this time)
+        let err = r.can_trade_at(20.0, 1_700_000_000_000, &cfg()).unwrap_err();
+        assert_eq!(err, RiskError::KillSwitchActive);
     }
 
     #[test]

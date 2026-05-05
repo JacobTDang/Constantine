@@ -101,9 +101,14 @@ async fn main() -> anyhow::Result<()> {
         state.clone(), risk_limits.clone(), watchdog_cfg,
     ));
 
-    // S7.4 — Heartbeat: 30s status log so ops can grep "HB".
+    // S7.4 — Heartbeat: 30s status log so ops can grep "HB". G7 adds
+    // realised P&L + current bankroll so ops can see compounding live.
+    let starting_bankroll = exec_cfg.as_ref()
+        .map(|c| c.bankroll)
+        .unwrap_or(1500.0);
     tasks.spawn(risk::heartbeat::heartbeat_loop(
-        state.clone(), risk_limits.clone(), positions.clone(), 30,
+        state.clone(), risk_limits.clone(), positions.clone(),
+        starting_bankroll, 30,
     ));
 
     // G2 — USDC allowance watchdog. Polls the CTF Exchange's allowance

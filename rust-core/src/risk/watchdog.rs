@@ -132,22 +132,40 @@ pub async fn watchdog_loop(
         };
 
         if report.any_stale() {
-            tracing::error!(
-                stale = ?report.stale_streams,
-                spot_age_ms      = report.spot_age_ms,
-                chainlink_age_ms = report.chainlink_age_ms,
-                book_age_ms      = report.book_age_ms,
-                "DATA STALE — tripping kill switch"
-            );
-            if cfg.trip_kill_switch && !risk.is_kill_switch_active() {
-                risk.activate_kill_switch();
+            if !risk.is_data_stale() {
+                // First detection of staleness — log loudly.
+                tracing::error!(
+                    stale = ?report.stale_streams,
+                    spot_age_ms      = report.spot_age_ms,
+                    chainlink_age_ms = report.chainlink_age_ms,
+                    book_age_ms      = report.book_age_ms,
+                    "DATA STALE — halting trading until streams recover"
+                );
+            }
+            // G11: set the transient data_stale flag (NOT the sticky
+            // kill switch). cfg.trip_kill_switch acts as a master enable
+            // for trading-side gating in observe-mode.
+            if cfg.trip_kill_switch {
+                risk.set_data_stale(true);
             }
         } else {
-            tracing::trace!(
-                spot_age_ms = report.spot_age_ms,
-                book_age_ms = report.book_age_ms,
-                "watchdog OK"
-            );
+            // G11: streams healthy again — auto-clear the data_stale flag
+            // so trading resumes. Loss-limit kill switches are sticky and
+            // remain unaffected.
+            if risk.is_data_stale() {
+                risk.set_data_stale(false);
+                tracing::info!(
+                    spot_age_ms = report.spot_age_ms,
+                    book_age_ms = report.book_age_ms,
+                    "data recovered — trading re-enabled"
+                );
+            } else {
+                tracing::trace!(
+                    spot_age_ms = report.spot_age_ms,
+                    book_age_ms = report.book_age_ms,
+                    "watchdog OK"
+                );
+            }
         }
     }
 }
@@ -244,9 +262,8 @@ mod tests {
     // ── Integration: full loop trip ───────────────────────────────────────
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn watchdog_trips_kill_switch_on_stale() {
+    async fn watchdog_sets_data_stale_on_stale() {
         let mut s = FeatureState::default();
-        // Set spot to stale
         let now_ms = chrono::Utc::now().timestamp_millis() as u64;
         s.last_spot_update_ms = now_ms - 60_000;   // 60s old, > 30s threshold
         let state = Arc::new(RwLock::new(s));
@@ -260,21 +277,18 @@ mod tests {
             trip_kill_switch:    true,
         };
 
-        // Run the watchdog loop briefly
         let r2 = risk.clone();
         let h = tokio::spawn(watchdog_loop(state, r2, cfg));
-        // Wait long enough for one tick (>5s default).
-        // Use a smaller poll interval pattern by manually running check_staleness:
-        // ↑ The actual loop has 5s intervals; for the test we just call check()
-        //   indirectly by sleeping a tick + epsilon. Tighten below if flaky.
         tokio::time::sleep(Duration::from_secs(6)).await;
         h.abort();
 
-        assert!(risk.is_kill_switch_active(), "kill switch should be activated");
+        // G11: stale data sets data_stale (transient), NOT kill_switch (sticky)
+        assert!(risk.is_data_stale(),         "data_stale should be set");
+        assert!(!risk.is_kill_switch_active(), "kill_switch must NOT be tripped on stale data");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn watchdog_does_not_trip_on_fresh_data() {
+    async fn watchdog_does_not_set_data_stale_on_fresh_data() {
         let now_ms = chrono::Utc::now().timestamp_millis() as u64;
         let state = Arc::new(RwLock::new(fresh_state(now_ms)));
         let risk = Arc::new(RiskLimits::new());
@@ -286,6 +300,53 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(6)).await;
         h.abort();
 
+        assert!(!risk.is_data_stale());
         assert!(!risk.is_kill_switch_active());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watchdog_auto_resets_data_stale_on_recovery() {
+        // Start with stale state, let watchdog set the flag, then freshen
+        // the state and verify the flag clears on the next tick.
+        let now_ms = chrono::Utc::now().timestamp_millis() as u64;
+        let mut s = FeatureState::default();
+        s.last_spot_update_ms = now_ms - 60_000;   // stale
+        let state = Arc::new(RwLock::new(s));
+        let risk = Arc::new(RiskLimits::new());
+        let cfg = WatchdogConfig::default();
+
+        let r2 = risk.clone();
+        let s2 = state.clone();
+        let h = tokio::spawn(watchdog_loop(s2, r2, cfg));
+        // First tick → data_stale set
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert!(risk.is_data_stale());
+
+        // Freshen the state in-place (simulates streams recovering)
+        {
+            let mut w = state.write().await;
+            w.last_spot_update_ms      = chrono::Utc::now().timestamp_millis() as u64;
+            w.last_book_update_ms      = chrono::Utc::now().timestamp_millis() as u64;
+            w.last_chainlink_update_ms = chrono::Utc::now().timestamp_millis() as u64;
+        }
+
+        // Wait for next tick → data_stale auto-cleared
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        h.abort();
+        assert!(!risk.is_data_stale(), "data_stale should auto-clear on recovery");
+    }
+
+    #[test]
+    fn data_stale_does_not_clear_loss_kill_switch() {
+        // Loss-limit / manual kill switch trips MUST NOT be cleared by
+        // watchdog observing fresh data — that path is manual-reset only.
+        let r = RiskLimits::new();
+        r.activate_kill_switch();
+        r.set_data_stale(true);
+        // Simulate watchdog seeing fresh data
+        r.set_data_stale(false);
+        // Kill switch still tripped
+        assert!(r.is_kill_switch_active());
+        assert!(!r.is_data_stale());
     }
 }

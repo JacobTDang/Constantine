@@ -150,11 +150,15 @@ pub async fn execute_signal(
         }
     };
 
-    // 2. Kelly sizing — caller's bankroll/kelly_fraction/max_bet from RiskConfig.
+    // 2. Kelly sizing — bankroll compounds with realised P&L (G7).
+    // After a $50 loss, kelly bets a smaller dollar amount; after a $50
+    // gain, it bets a larger one. Static `risk_cfg.bankroll` is just the
+    // *starting* bankroll — current_bankroll() folds in net realised P&L.
+    let bankroll = ctx.risk.current_bankroll(ctx.risk_cfg.bankroll);
     let bet = kelly_size(
         target.p_win,
         target.price,
-        ctx.risk_cfg.bankroll,
+        bankroll,
         ctx.risk_cfg.kelly_fraction,
         ctx.risk_cfg.max_bet_dollars,
     );
