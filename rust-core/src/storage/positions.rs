@@ -29,6 +29,8 @@ use dashmap::DashMap;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use crate::execution::clob::{ClobClient, PolyTrade};
+
 // ── Public types ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -335,6 +337,153 @@ impl PositionStore {
         }
         Ok(n)
     }
+
+    // ── G13: Startup reconciliation against Polymarket ──────────────────
+
+    /// Cross-check our local ledger against Polymarket's view. For every
+    /// Submitted/Filled position we have on disk, ask Polymarket whether
+    /// it is still open, was filled (and at what price), or was cancelled
+    /// /failed. Updates the ledger so post-restart state matches reality.
+    ///
+    /// Best-effort: any RPC error is swallowed and reported in the
+    /// returned ReconcileReport. We never crash the bot on reconciliation
+    /// failures — a stale-but-non-corrupt ledger is better than a halted
+    /// bot at startup.
+    ///
+    /// Skips positions with `local-...` order IDs (DRY_RUN entries that
+    /// never hit Polymarket and have no remote counterpart to query).
+    pub async fn reconcile_with_polymarket(
+        &self,
+        client:  &ClobClient,
+        owner:   &str,
+    ) -> Result<ReconcileReport> {
+        let mut report = ReconcileReport::default();
+        let pending = self.pending_settlement();
+        report.checked = pending.len();
+
+        if pending.is_empty() {
+            return Ok(report);
+        }
+
+        // Fetch both endpoints once; reconcile against the snapshots.
+        let open_orders = match client.list_open_orders(owner).await {
+            Ok(v)  => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "list_open_orders failed — skipping reconciliation");
+                report.rpc_errors += 1;
+                return Ok(report);
+            }
+        };
+        // Look back ~24h for trades — covers any plausible bot downtime.
+        let after_ms = now_ms().saturating_sub(86_400_000);
+        let trades = match client.list_trades(owner, after_ms).await {
+            Ok(v)  => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "list_trades failed — skipping reconciliation");
+                report.rpc_errors += 1;
+                return Ok(report);
+            }
+        };
+
+        // Index for O(1) lookup
+        let open_ids: std::collections::HashSet<&str> =
+            open_orders.iter().map(|o| o.id.as_str()).collect();
+        let trades_by_taker: std::collections::HashMap<&str, &PolyTrade> =
+            trades.iter().map(|t| (t.taker_order_id.as_str(), t)).collect();
+
+        for p in &pending {
+            // Skip DRY_RUN-synthesised local IDs — they don't exist on Polymarket.
+            if p.order_id.starts_with("local-") {
+                report.skipped_local += 1;
+                continue;
+            }
+
+            match p.status {
+                PositionStatus::Submitted => {
+                    if open_ids.contains(p.order_id.as_str()) {
+                        // Still open on Polymarket — leave alone.
+                        report.still_open += 1;
+                    } else if let Some(trade) = trades_by_taker.get(p.order_id.as_str()) {
+                        // Got filled while we weren't looking.
+                        let price = trade.price_f64().unwrap_or(p.price);
+                        let size  = trade.size_f64().unwrap_or(0.0);
+                        if let Err(e) = self.record_fill(&p.order_id, price, size) {
+                            tracing::error!(error = %e, order_id = %p.order_id,
+                                "reconcile: record_fill failed");
+                            report.rpc_errors += 1;
+                        } else {
+                            report.filled_late += 1;
+                        }
+                    } else {
+                        // Not open and not in trades → cancelled or rejected.
+                        if let Err(e) = self.record_fail(&p.order_id, "reconcile: not found in /orders or /trades") {
+                            tracing::error!(error = %e, order_id = %p.order_id,
+                                "reconcile: record_fail failed");
+                            report.rpc_errors += 1;
+                        } else {
+                            report.failed_late += 1;
+                        }
+                    }
+                }
+                PositionStatus::Filled => {
+                    // Cross-check fill price/size against trade record.
+                    if let Some(trade) = trades_by_taker.get(p.order_id.as_str()) {
+                        if let (Some(remote_price), Some(local_price)) =
+                            (trade.price_f64(), p.fill_price)
+                        {
+                            let diff = (remote_price - local_price).abs();
+                            if diff > 0.01 {   // > 1¢ disagreement → log
+                                tracing::warn!(
+                                    order_id = %p.order_id,
+                                    local_price, remote_price, diff,
+                                    "reconcile: fill price disagreement",
+                                );
+                                report.discrepancies += 1;
+                            }
+                        }
+                    }
+                    // We don't unilaterally rewrite Filled positions on
+                    // discrepancy — that's a human-review decision.
+                }
+                _ => {}   // Settled / Failed already terminal
+            }
+        }
+
+        tracing::info!(
+            checked        = report.checked,
+            still_open     = report.still_open,
+            filled_late    = report.filled_late,
+            failed_late    = report.failed_late,
+            discrepancies  = report.discrepancies,
+            skipped_local  = report.skipped_local,
+            rpc_errors     = report.rpc_errors,
+            "position reconciliation complete"
+        );
+        Ok(report)
+    }
+}
+
+/// Outcome counts from one reconciliation pass. All counters are
+/// per-pending-position, so they sum to `checked - skipped_local` minus
+/// any rpc_errors that aborted early.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReconcileReport {
+    /// Total pending positions inspected.
+    pub checked:       usize,
+    /// Position is still open on Polymarket — left as Submitted.
+    pub still_open:    usize,
+    /// Found a matching trade — transitioned Submitted → Filled.
+    pub filled_late:   usize,
+    /// Not in /orders and not in /trades — transitioned Submitted → Failed.
+    pub failed_late:   usize,
+    /// Local Filled position whose remote trade record disagrees on price.
+    /// Logged but NOT auto-rewritten.
+    pub discrepancies: usize,
+    /// DRY_RUN local-* order IDs — skipped because they have no remote.
+    pub skipped_local: usize,
+    /// RPC failures during the call. Reconciliation degrades gracefully —
+    /// these are reported, not raised.
+    pub rpc_errors:    usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -517,6 +666,200 @@ mod tests {
         let n = store.settle_pending(|_| None).unwrap();
         assert_eq!(n, 0);
         assert_eq!(store.pending_settlement().len(), 1);
+    }
+
+    // ── G13: reconciliation ──────────────────────────────────────────────
+
+    use crate::execution::clob::{ClobClient, ClobConfig};
+    use crate::execution::auth::ApiCreds;
+    use base64::{engine::general_purpose::URL_SAFE, Engine as _};
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    fn sample_creds() -> ApiCreds {
+        ApiCreds {
+            api_key:        "00000000-1111-2222-3333-444444444444".into(),
+            api_secret:     URL_SAFE.encode(b"test-secret-bytes-here-32-chars!"),
+            api_passphrase: "passphrase".into(),
+        }
+    }
+
+    /// Spin up a tiny TCP server that responds to N requests sequentially
+    /// from the supplied list of (status, body) tuples. Returns the base
+    /// URL the test should hit. Each request consumes one item.
+    async fn fixed_responses(responses: Vec<(u16, &'static str)>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for (status, body) in responses {
+                if let Ok((mut sock, _)) = listener.accept().await {
+                    let mut buf = [0u8; 8192];
+                    let _ = sock.read(&mut buf).await;
+                    let resp = format!(
+                        "HTTP/1.1 {} OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
+                        status, body.len(), body,
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                }
+            }
+        });
+        format!("http://{}", addr)
+    }
+
+    fn build_live_client(base_url: String) -> ClobClient {
+        let mut cfg = ClobConfig::new("0xdead", sample_creds(), /*dry_run=*/false);
+        cfg.base_url = base_url;
+        cfg.max_retries = 0;
+        cfg.initial_backoff_ms = 1;
+        ClobClient::new(cfg).unwrap()
+    }
+
+    #[tokio::test]
+    async fn reconcile_filled_late_marks_position_filled() {
+        // Submitted in our ledger; Polymarket says it's a trade (i.e. filled).
+        let dir = temp_dir();
+        let store = PositionStore::open(&dir).unwrap();
+        store.record_open("0xORDERX", "m", "yes", 5.0, 0.45).unwrap();
+
+        let base = fixed_responses(vec![
+            (200, "[]"),    // /data/orders — empty
+            (200, r#"[{"id":"t1","taker_order_id":"0xORDERX","price":"0.46","size":"11.0"}]"#),
+        ]).await;
+        let client = build_live_client(base);
+
+        let report = store.reconcile_with_polymarket(&client, "0xWALLET").await.unwrap();
+        assert_eq!(report.checked,     1);
+        assert_eq!(report.filled_late, 1);
+        let p = store.get("0xORDERX").unwrap();
+        assert_eq!(p.status, PositionStatus::Filled);
+        assert!((p.fill_price.unwrap() - 0.46).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn reconcile_still_open_leaves_position_alone() {
+        let dir = temp_dir();
+        let store = PositionStore::open(&dir).unwrap();
+        store.record_open("0xORDERY", "m", "yes", 5.0, 0.45).unwrap();
+
+        let base = fixed_responses(vec![
+            (200, r#"[{"id":"0xORDERY","status":"live"}]"#),    // still in /orders
+            (200, "[]"),                                          // no trades
+        ]).await;
+        let client = build_live_client(base);
+
+        let report = store.reconcile_with_polymarket(&client, "0xWALLET").await.unwrap();
+        assert_eq!(report.still_open, 1);
+        let p = store.get("0xORDERY").unwrap();
+        assert_eq!(p.status, PositionStatus::Submitted);
+    }
+
+    #[tokio::test]
+    async fn reconcile_failed_late_when_absent_from_both() {
+        let dir = temp_dir();
+        let store = PositionStore::open(&dir).unwrap();
+        store.record_open("0xGHOST", "m", "yes", 5.0, 0.45).unwrap();
+
+        let base = fixed_responses(vec![
+            (200, "[]"),
+            (200, "[]"),
+        ]).await;
+        let client = build_live_client(base);
+
+        let report = store.reconcile_with_polymarket(&client, "0xWALLET").await.unwrap();
+        assert_eq!(report.failed_late, 1);
+        let p = store.get("0xGHOST").unwrap();
+        assert_eq!(p.status, PositionStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn reconcile_skips_local_dry_run_ids() {
+        let dir = temp_dir();
+        let store = PositionStore::open(&dir).unwrap();
+        store.record_open("local-deadbeefcafebabe", "m", "yes", 5.0, 0.45).unwrap();
+
+        let base = fixed_responses(vec![
+            (200, "[]"),
+            (200, "[]"),
+        ]).await;
+        let client = build_live_client(base);
+
+        let report = store.reconcile_with_polymarket(&client, "0xWALLET").await.unwrap();
+        assert_eq!(report.skipped_local, 1);
+        assert_eq!(report.failed_late,   0);
+        let p = store.get("local-deadbeefcafebabe").unwrap();
+        // Untouched
+        assert_eq!(p.status, PositionStatus::Submitted);
+    }
+
+    #[tokio::test]
+    async fn reconcile_logs_discrepancy_on_filled_price_mismatch() {
+        // Local Filled at 0.45, remote trade says 0.50 — log warning,
+        // don't unilaterally rewrite.
+        let dir = temp_dir();
+        let store = PositionStore::open(&dir).unwrap();
+        store.record_open("0xFILLED", "m", "yes", 5.0, 0.45).unwrap();
+        store.record_fill("0xFILLED", 0.45, 11.0).unwrap();
+
+        let base = fixed_responses(vec![
+            (200, "[]"),
+            (200, r#"[{"id":"t1","taker_order_id":"0xFILLED","price":"0.50","size":"10.0"}]"#),
+        ]).await;
+        let client = build_live_client(base);
+
+        let report = store.reconcile_with_polymarket(&client, "0xWALLET").await.unwrap();
+        assert_eq!(report.discrepancies, 1);
+        // Status untouched
+        let p = store.get("0xFILLED").unwrap();
+        assert_eq!(p.status, PositionStatus::Filled);
+        assert!((p.fill_price.unwrap() - 0.45).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn reconcile_degrades_on_orders_rpc_failure() {
+        // /orders returns 500 — must not crash, returns rpc_errors=1.
+        let dir = temp_dir();
+        let store = PositionStore::open(&dir).unwrap();
+        store.record_open("0xORDER", "m", "yes", 5.0, 0.45).unwrap();
+
+        let base = fixed_responses(vec![
+            (500, r#"{"error":"oops"}"#),
+        ]).await;
+        let client = build_live_client(base);
+
+        let report = store.reconcile_with_polymarket(&client, "0xWALLET").await.unwrap();
+        assert_eq!(report.rpc_errors, 1);
+        // Position untouched on RPC failure
+        let p = store.get("0xORDER").unwrap();
+        assert_eq!(p.status, PositionStatus::Submitted);
+    }
+
+    #[tokio::test]
+    async fn reconcile_empty_pending_list_is_a_noop() {
+        let dir = temp_dir();
+        let store = PositionStore::open(&dir).unwrap();
+        // No positions to reconcile — should not even hit the network.
+        let mut cfg = ClobConfig::new("0xdead", sample_creds(), false);
+        cfg.base_url = "http://127.0.0.1:1".to_string();   // unreachable
+        cfg.max_retries = 0;
+        let client = ClobClient::new(cfg).unwrap();
+
+        let report = store.reconcile_with_polymarket(&client, "0xWALLET").await.unwrap();
+        assert_eq!(report.checked, 0);
+        assert_eq!(report.rpc_errors, 0);
+    }
+
+    #[tokio::test]
+    async fn reconcile_dry_run_short_circuits_to_empty() {
+        let dir = temp_dir();
+        let store = PositionStore::open(&dir).unwrap();
+        store.record_open("0xORDER", "m", "yes", 5.0, 0.45).unwrap();
+
+        let cfg = ClobConfig::new("0xdead", sample_creds(), /*dry_run=*/true);
+        let client = ClobClient::new(cfg).unwrap();
+
+        let report = store.reconcile_with_polymarket(&client, "0xWALLET").await.unwrap();
+        // DRY_RUN list_open_orders + list_trades both return empty →
+        // position interpreted as failed_late.
+        assert_eq!(report.failed_late, 1);
     }
 
     // ── Concurrent writes ─────────────────────────────────────────────────

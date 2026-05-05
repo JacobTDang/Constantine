@@ -198,21 +198,27 @@ with real money.**
 
 ---
 
-## Fixes applied in this commit
+## Fixes applied in earlier commits
 
-- G3: market discovery cadence 300s → 30s
-- G6: runner tick 500ms → 200ms
-- G2: USDC allowance monitoring in the watchdog
-- G10: baseline comparison in observe_report.py
+- G2 (USDC allowance watchdog) — `8dce1d0`
+- G3 (market discovery cadence) — `8dce1d0`
+- G5 (kelly-aware order sizing) — `64b08a0`
+- G6 (runner tick 500ms → 200ms) — `8dce1d0`
+- G10 (baseline comparison in observe_report.py) — `8dce1d0`
 
-## Fixes NOT applied (need user decision or architectural work)
+## Fixes applied in the second sweep
 
-- G1: settlement timing — needs historical RPC pattern
-- G4: pool re-population on midpoint drift
-- G5: kelly-aware order sizing
-- G7: dynamic bankroll
-- G11: kill switch auto-reset
-- G13: startup reconciliation against Polymarket
+- G1 (settlement at close-time chainlink) — `b9e7ca2`
+- G4 (pool staleness within window) — auto-resolved by G5 (no pool to stale)
+- G7 (dynamic bankroll, kelly compounds with realised P&L) — `95a1add`
+- G11 (watchdog auto-resets data-stale trips) — `95a1add`
+- G13 (startup reconciliation against Polymarket) — this commit
+
+## Still open (intentional / minor)
+
+- G8 (cooldown overlap) — working as designed; tunable per market type if needed
+- G9 (rate-limit awareness) — low impact at our trade volume; revisit if 429s appear
+- G12 (NTP / clock drift check) — unlikely on a server with NTP enabled
 
 ## Honest summary
 

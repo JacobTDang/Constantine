@@ -223,6 +223,36 @@ async fn main() -> anyhow::Result<()> {
                     fee_rate_bps:    0,
                     taker:           [0u8; 20],
                 });
+                // G13: reconcile our local ledger against Polymarket BEFORE
+                // spawning the runner. Catches positions that filled or
+                // failed while the bot was down. Best-effort: any failure
+                // is logged but doesn't block boot.
+                {
+                    let address_for_reconcile = signing.funder_address.clone()
+                        .unwrap_or_else(|| {
+                            execution::orders::private_key_to_address(&c.polymarket_private_key)
+                                .map(|a| execution::orders::address_to_hex(&a))
+                                .unwrap_or_default()
+                        });
+                    if !address_for_reconcile.is_empty() {
+                        match positions
+                            .reconcile_with_polymarket(&client, &address_for_reconcile)
+                            .await
+                        {
+                            Ok(r) => tracing::info!(
+                                checked = r.checked,
+                                filled_late = r.filled_late,
+                                failed_late = r.failed_late,
+                                discrepancies = r.discrepancies,
+                                rpc_errors = r.rpc_errors,
+                                "G13: startup reconciliation complete"
+                            ),
+                            Err(e) => tracing::warn!(error = %e,
+                                "G13: reconciliation failed — continuing with local state"),
+                        }
+                    }
+                }
+
                 tasks.spawn(execution::runner::execution_runner_loop(
                     state.clone(),
                     markets.clone(),

@@ -27,8 +27,8 @@ use crate::execution::orders::{
     u256_from_dec, Domain, SignatureType, SignedOrder,
 };
 #[cfg(test)]
-use crate::execution::presign::{OrderPool, PoolKey, PopulateParams};
-use crate::execution::presign::{sign_buy_now, BuyOrderInputs};
+use crate::execution::presign::PoolKey;
+use crate::execution::presign::{sign_buy_now, BuyOrderInputs, OrderPool, PopulateParams};
 use crate::features::FeatureState;
 use crate::risk::limits::{RiskConfig, RiskLimits};
 use crate::signals::intramarket::IntramarketArbSignal;

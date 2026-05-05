@@ -39,6 +39,8 @@ use crate::execution::orders::{
 
 pub const POLYMARKET_CLOB_BASE_URL: &str = "https://clob.polymarket.com";
 pub const ORDER_PATH:                &str = "/order";
+pub const DATA_ORDERS_PATH:          &str = "/data/orders";
+pub const DATA_TRADES_PATH:          &str = "/data/trades";
 
 /// Polymarket time-in-force values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -319,6 +321,126 @@ impl ClobClient {
             attempts:    total_attempts,
         })
     }
+
+    // ── G13: Read-side endpoints for startup reconciliation ─────────────
+
+    /// Fetch the open orders Polymarket has on file for `owner`.
+    /// In DRY_RUN returns an empty vec (we don't have orders on Polymarket
+    /// in dry-run mode anyway).
+    pub async fn list_open_orders(&self, owner: &str) -> Result<Vec<PolyOpenOrder>> {
+        if self.cfg.dry_run { return Ok(Vec::new()); }
+        let url = format!("{}{}?owner={}", self.cfg.base_url, DATA_ORDERS_PATH, owner);
+        let body: Vec<PolyOpenOrder> = self
+            .http_get_authed(DATA_ORDERS_PATH, &format!("?owner={}", owner), &url)
+            .await?;
+        Ok(body)
+    }
+
+    /// Fetch trades (fills) for `maker` since `after_ms`. Returns most-recent
+    /// first per Polymarket's ordering. In DRY_RUN returns an empty vec.
+    pub async fn list_trades(&self, maker: &str, after_ms: u64) -> Result<Vec<PolyTrade>> {
+        if self.cfg.dry_run { return Ok(Vec::new()); }
+        let after_secs = after_ms / 1_000;
+        let qs  = format!("?maker={}&after={}", maker, after_secs);
+        let url = format!("{}{}{}", self.cfg.base_url, DATA_TRADES_PATH, qs);
+        let body: Vec<PolyTrade> = self
+            .http_get_authed(DATA_TRADES_PATH, &qs, &url)
+            .await?;
+        Ok(body)
+    }
+
+    /// Authed GET helper. Signs the request with the L2 HMAC headers
+    /// (matching what submit_order does on POST). Used by the read-side
+    /// reconciliation endpoints. No retry — these are read calls; if
+    /// they fail, callers degrade gracefully (skip reconciliation, don't
+    /// crash the bot).
+    async fn http_get_authed<T: serde::de::DeserializeOwned>(
+        &self,
+        path:     &str,
+        qs:       &str,
+        full_url: &str,
+    ) -> Result<T> {
+        // The signature is computed over (timestamp + "GET" + path + body).
+        // For GETs the body is empty. Polymarket signs the path WITHOUT
+        // the query string — confirmed against py-clob-client.
+        let _ = qs;   // qs is part of the URL but not the signed message
+        let headers = auth_headers_now(
+            &self.cfg.address,
+            &self.cfg.creds,
+            "GET",
+            path,
+            "",
+        ).context("auth_headers_now (GET)")?;
+
+        let mut req = self.http.get(full_url);
+        for (k, v) in &headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
+        let resp = req.send().await.context("GET send")?;
+        let status = resp.status();
+        let text = resp.text().await.context("GET body read")?;
+        if !status.is_success() {
+            anyhow::bail!("HTTP {}: {}", status, truncate(&text, 200));
+        }
+        serde_json::from_str(&text)
+            .with_context(|| format!("parse {} response: {}", path, truncate(&text, 200)))
+    }
+}
+
+// ── G13: Read-side response schemas ─────────────────────────────────────────
+
+/// A single order Polymarket considers "open" for our wallet. We only
+/// keep the fields we need for reconciliation; serde::default makes us
+/// tolerant of new fields Polymarket adds over time.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PolyOpenOrder {
+    /// Polymarket order id (matches what we stored as `order_id` after a
+    /// successful submit_order).
+    #[serde(rename = "id", alias = "order_id")]
+    pub id:       String,
+    #[serde(default)]
+    pub status:   String,        // "live", "matched", "cancelled", ...
+    #[serde(default)]
+    pub asset_id: String,
+    #[serde(default)]
+    pub side:     String,
+    /// Original requested price (decimal string).
+    #[serde(default)]
+    pub price:    String,
+    /// Total size requested.
+    #[serde(default)]
+    pub size:     String,
+    /// Already-filled portion.
+    #[serde(rename = "size_matched", alias = "matched_size", default)]
+    pub size_matched: String,
+}
+
+/// A trade (fill) Polymarket has on record for our wallet.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PolyTrade {
+    #[serde(default)]
+    pub id:             String,
+    #[serde(rename = "taker_order_id", default)]
+    pub taker_order_id: String,
+    #[serde(rename = "maker_order_id", default)]
+    pub maker_order_id: String,
+    /// Fill price as a decimal string.
+    #[serde(default)]
+    pub price:          String,
+    /// Fill size as a decimal string.
+    #[serde(default)]
+    pub size:           String,
+    #[serde(default)]
+    pub side:           String,
+    #[serde(rename = "match_time", alias = "timestamp", default)]
+    pub timestamp:      String,
+}
+
+impl PolyTrade {
+    /// Best-effort numeric parse of the price string. Returns None on bad
+    /// input rather than failing — reconciliation must degrade gracefully.
+    pub fn price_f64(&self) -> Option<f64> { self.price.parse().ok() }
+    pub fn size_f64(&self)  -> Option<f64> { self.size.parse().ok()  }
 }
 
 // ── Wire conversion ──────────────────────────────────────────────────────────

@@ -18,7 +18,9 @@ pub mod dashboard;
 pub mod positions;
 pub mod settlement;
 
-pub use positions::{Position, PositionEvent, PositionStatus, PositionStore, SettleOutcome};
+pub use positions::{
+    Position, PositionEvent, PositionStatus, PositionStore, ReconcileReport, SettleOutcome,
+};
 
 use std::fs::OpenOptions;
 use std::io::Write;
