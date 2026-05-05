@@ -211,7 +211,22 @@ async fn main() -> anyhow::Result<()> {
                     max_touch_consumption:   0.5,
                     max_bet_dollars:         c.max_bet_dollars,
                 };
-                let runner_cfg = execution::runner::RunnerConfig::default();
+                // Strategy 1: NBA player-prop projections cache. Reloaded
+                // every 30s from data/nba_projections.json. The Python
+                // sidecar (scripts/nba_projections.py --watch) writes this
+                // file. If the sidecar isn't running, the cache stays
+                // empty and props are silently skipped.
+                let projections_cache = Arc::new(
+                    signals::player_props::ProjectionsCache::new()
+                );
+                let mut runner_cfg = execution::runner::RunnerConfig::default();
+                runner_cfg.projections_cache = Some(projections_cache.clone());
+                runner_cfg.projections_path  = Some(
+                    std::path::PathBuf::from(
+                        signals::player_props::DEFAULT_PROJECTIONS_PATH
+                    )
+                );
+                runner_cfg.projections_reload_secs = 30;
                 // G5: SigningParams replaces the pool. Built once, cloned
                 // per-task by the runner. Kelly bet is honored exactly.
                 let signing = Arc::new(execution::executor::SigningParams {

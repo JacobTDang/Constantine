@@ -143,6 +143,40 @@ These do NOT block going live but are worth understanding:
   `compute_paper_pnl`.
 - **No automatic USDC approval** — by design. You approve once via UI.
 
+## Strategy 1 — NBA Player Props sidecar
+
+The bot reads NBA player-prop projections from `data/nba_projections.json`.
+That file is written by a separate Python sidecar; **the bot does NOT
+generate projections itself**. To enable Strategy 1:
+
+```bash
+# Terminal 1: bot
+cargo run --release --bin polymarket-bot
+
+# Terminal 2: NBA projections sidecar (refreshes every 5 min)
+python scripts/nba_projections.py --watch
+```
+
+The sidecar fetches all open Polymarket NBA prop markets, looks up
+each player's rolling stats via `nba_api`, and writes a projection
+JSON every 5 minutes. The bot's `ProjectionsCache` reloads the file
+every 30s. Without the sidecar running, the cache stays empty and
+prop signals are silently skipped — no harm, just no Strategy 1
+trades.
+
+Inspect projected edges anytime:
+
+```bash
+python -c "
+import json
+d = json.load(open('data/nba_projections.json'))
+contested = [p for p in d['projections'] if 0.20 < p['yes_ask'] < 0.80]
+contested.sort(key=lambda p: abs(p['edge_over']), reverse=True)
+for p in contested[:10]:
+    print(f'{p[\"question\"]:<60} edge_over={p[\"edge_over\"]:+.3f}')
+"
+```
+
 ## Useful commands
 
 ```bash
@@ -151,6 +185,9 @@ cargo run --release --bin polymarket-bot
 
 # Dashboard alongside (separate terminal)
 cargo run --release --bin dashboard
+
+# NBA projections sidecar (Strategy 1)
+python scripts/nba_projections.py --watch
 
 # Pre-flight check
 python scripts/preflight.py

@@ -20,6 +20,7 @@ use serde::Deserialize;
 
 use crate::signals::{Direction, SignalDecision};
 use crate::signals::oracle_arb::OracleArbSignal;
+use crate::streams::polymarket::PolyMarket;
 
 /// Default location the python sidecar writes to.
 pub const DEFAULT_PROJECTIONS_PATH: &str = "data/nba_projections.json";
@@ -130,6 +131,24 @@ impl ProjectionsCache {
 
     pub fn len(&self) -> usize {
         self.inner.read().expect("poisoned").len()
+    }
+
+    /// Build a Vec<PolyMarket> view of the cache. The runner concatenates
+    /// these into the markets snapshot so prop markets are first-class
+    /// citizens in the executor's resolve_target lookup. Synthetic markets
+    /// silently skip the regular oracle/intramarket eval (state.asset_books
+    /// won't have prop token IDs).
+    pub fn synthesize_polymarkets(&self) -> Vec<PolyMarket> {
+        let map = self.inner.read().expect("poisoned");
+        map.values().map(|p| PolyMarket {
+            id:             p.condition_id.clone(),
+            question:       p.question.clone(),
+            up_token_id:    p.yes_token_id.clone(),
+            down_token_id:  p.no_token_id.clone(),
+            close_time_ms:  p.end_date_ms.max(0) as u64,
+            duration_min:   0,        // not a windowed market
+            liquidity_usd:  p.liquidity,
+        }).collect()
     }
 }
 
@@ -364,6 +383,52 @@ mod tests {
         cache.reload(&path).unwrap();
         let now = chrono::Utc::now().timestamp_millis() as u64;
         assert!(cache.is_stale(now));
+    }
+
+    // ── synthesize_polymarkets ──────────────────────────────────────────
+
+    #[test]
+    fn synthesize_polymarkets_maps_fields_correctly() {
+        let path = temp_path();
+        let payload = serde_json::json!({
+            "generated_at_ms": chrono::Utc::now().timestamp_millis(),
+            "n_markets": 1,
+            "projections": [{
+                "market_id":    "m1",
+                "condition_id": "0xCONDITION",
+                "question":     "Joel Embiid: Rebounds O/U 8.5",
+                "player":       "Joel Embiid",
+                "stat":         "Rebounds",
+                "stat_code":    "REB",
+                "line":         8.5,
+                "yes_token_id": "TOKEN_YES",
+                "no_token_id":  "TOKEN_NO",
+                "yes_ask":      0.50, "yes_bid": 0.49,
+                "end_date_ms":  9_999_999_999_000_u64,
+                "liquidity":    1234.5, "volume": 678.0,
+                "p_over":       0.62, "edge_over": 0.12, "edge_under": -0.12,
+                "diagnostics":  {},
+            }],
+        });
+        std::fs::write(&path, payload.to_string()).unwrap();
+        let cache = ProjectionsCache::new();
+        cache.reload(&path).unwrap();
+
+        let markets = cache.synthesize_polymarkets();
+        assert_eq!(markets.len(), 1);
+        let m = &markets[0];
+        assert_eq!(m.id,             "0xCONDITION");
+        assert_eq!(m.up_token_id,    "TOKEN_YES");
+        assert_eq!(m.down_token_id,  "TOKEN_NO");
+        assert_eq!(m.close_time_ms,  9_999_999_999_000);
+        assert_eq!(m.duration_min,   0);
+        assert!((m.liquidity_usd - 1234.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn synthesize_polymarkets_empty_cache_returns_empty() {
+        let cache = ProjectionsCache::new();
+        assert!(cache.synthesize_polymarkets().is_empty());
     }
 
     // ── evaluate_all_props ──────────────────────────────────────────────

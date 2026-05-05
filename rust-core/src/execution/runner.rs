@@ -25,10 +25,13 @@ use dashmap::DashMap;
 use tokio::sync::RwLock;
 use tokio::time::{Duration, MissedTickBehavior};
 
+use std::path::PathBuf;
+
 use crate::execution::clob::ClobClient;
 use crate::execution::executor::{execute_signal, ExecContext, SigningParams};
 use crate::features::FeatureState;
 use crate::risk::limits::{RiskConfig, RiskLimits};
+use crate::signals::player_props::{evaluate_all_props, ProjectionsCache};
 use crate::signals::{evaluate_all_markets, SignalConfig, SignalDecision};
 use crate::storage::PositionStore;
 use crate::streams::polymarket::PolyMarket;
@@ -46,6 +49,12 @@ pub struct RunnerConfig {
     pub min_market_cooldown_secs: u64,
     /// Maximum tokio tasks in flight at once. Bounds memory + clob requests.
     pub max_concurrent_submits: usize,
+    /// Strategy 1 — NBA player props. When set, runner periodically reloads
+    /// the projections cache from disk and emits prop signals alongside
+    /// oracle/intramarket. None = props strategy disabled.
+    pub projections_cache:        Option<Arc<ProjectionsCache>>,
+    pub projections_path:         Option<PathBuf>,
+    pub projections_reload_secs:  u64,
 }
 
 impl Default for RunnerConfig {
@@ -53,6 +62,9 @@ impl Default for RunnerConfig {
         Self {
             min_market_cooldown_secs: 60,
             max_concurrent_submits:   8,
+            projections_cache:        None,
+            projections_path:         None,
+            projections_reload_secs:  30,
         }
     }
 }
@@ -81,24 +93,56 @@ pub async fn execution_runner_loop(
     tracing::info!(
         cooldown_secs = runner_cfg.min_market_cooldown_secs,
         max_concurrent = runner_cfg.max_concurrent_submits,
+        props_enabled = runner_cfg.projections_cache.is_some(),
         "execution runner loop started"
     );
+
+    // Strategy 1 — periodic projections reload. Runs as a sibling task so
+    // file I/O doesn't block the tick. Errors are logged and swallowed.
+    if let (Some(cache), Some(path)) =
+        (runner_cfg.projections_cache.clone(), runner_cfg.projections_path.clone())
+    {
+        let secs = runner_cfg.projections_reload_secs.max(5);
+        tokio::spawn(async move {
+            let mut t = tokio::time::interval(Duration::from_secs(secs));
+            t.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            loop {
+                t.tick().await;
+                match cache.reload(&path) {
+                    Ok(n) => tracing::trace!(n_markets = n, "projections cache reload"),
+                    Err(e) => tracing::warn!(error = %e, "projections reload failed"),
+                }
+            }
+        });
+    }
 
     loop {
         tick.tick().await;
 
         // Snapshot once per tick — drop locks before any spawn.
         let now_ms = chrono::Utc::now().timestamp_millis() as u64;
-        let markets_snapshot = markets.read().await.clone();
+        let mut markets_snapshot = markets.read().await.clone();
         let state_snapshot = {
             let s = state.read().await;
             (*s).clone()
         };
 
-        // Evaluate all active markets in parallel via rayon.
-        let decisions = evaluate_all_markets(
+        // Strategy 1: append synthetic prop markets so resolve_target can
+        // route prop signals via the standard markets-list lookup.
+        // (evaluate_all_markets safely skips them — no asset_books for props.)
+        if let Some(cache) = runner_cfg.projections_cache.as_ref() {
+            markets_snapshot.extend(cache.synthesize_polymarkets());
+        }
+
+        // Evaluate all active markets in parallel via rayon (oracle + intramarket).
+        let mut decisions = evaluate_all_markets(
             &state_snapshot, &markets_snapshot, &sig_cfg, now_ms,
         );
+
+        // Strategy 1: append prop signals from the projections cache.
+        if let Some(cache) = runner_cfg.projections_cache.as_ref() {
+            decisions.extend(evaluate_all_props(cache));
+        }
 
         // Dispatch every fired signal as an independent tokio task.
         for (market_id, decision) in decisions {
@@ -199,13 +243,21 @@ pub async fn run_one_tick(
     runner_cfg:  &RunnerConfig,
     now_ms:      u64,
 ) -> Result<Vec<(String, &'static str)>> {
-    let markets_snapshot = markets.read().await.clone();
+    let mut markets_snapshot = markets.read().await.clone();
     let state_snapshot = {
         let s = state.read().await;
         (*s).clone()
     };
 
-    let decisions = evaluate_all_markets(&state_snapshot, &markets_snapshot, sig_cfg, now_ms);
+    // Mirror execution_runner_loop's eval shape so tests can drive the
+    // full prop-signal path through this helper.
+    if let Some(cache) = runner_cfg.projections_cache.as_ref() {
+        markets_snapshot.extend(cache.synthesize_polymarkets());
+    }
+    let mut decisions = evaluate_all_markets(&state_snapshot, &markets_snapshot, sig_cfg, now_ms);
+    if let Some(cache) = runner_cfg.projections_cache.as_ref() {
+        decisions.extend(evaluate_all_props(cache));
+    }
 
     let mut handles = Vec::new();
     for (market_id, decision) in decisions {
@@ -391,7 +443,11 @@ mod tests {
         let mut sig_cfg = SignalConfig::default();
         sig_cfg.min_window_age_secs = 0.0;
         let runner_cfg = RunnerConfig {
-            min_market_cooldown_secs: 60, max_concurrent_submits: 8,
+            min_market_cooldown_secs: 60,
+            max_concurrent_submits:   8,
+            projections_cache:        None,
+            projections_path:         None,
+            projections_reload_secs:  30,
         };
 
         // First tick — 2 submits
@@ -470,5 +526,152 @@ mod tests {
         ).await.unwrap();
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].0, "m2");
+    }
+
+    // ── Strategy 1: prop signal integration ──────────────────────────────
+
+    async fn write_prop_cache(p_over: f64, yes_ask: f64, yes_bid: f64,
+                              cid: &str, yes_tok: &str, no_tok: &str) -> ProjectionsCache {
+        let path = std::env::temp_dir().join(format!(
+            "constantine-runner-props-{}.json", uuid::Uuid::new_v4()
+        ));
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let payload = serde_json::json!({
+            "generated_at_ms": now_ms,
+            "n_markets": 1,
+            "projections": [{
+                "market_id":    cid, "condition_id": cid,
+                "question":     "Joel Embiid: Rebounds O/U 8.5",
+                "player": "Joel Embiid", "stat": "Rebounds",
+                "stat_code": "REB", "line": 8.5,
+                "yes_token_id": yes_tok, "no_token_id": no_tok,
+                "yes_ask": yes_ask, "yes_bid": yes_bid,
+                "end_date_ms":  9_999_999_999_000_u64,
+                "liquidity": 5000.0, "volume": 500.0,
+                "p_over": p_over,
+                "edge_over": p_over - yes_ask, "edge_under": (1.0 - p_over) - (1.0 - yes_bid),
+                "diagnostics": {},
+            }],
+        });
+        std::fs::write(&path, payload.to_string()).unwrap();
+        let cache = ProjectionsCache::new();
+        cache.reload(&path).unwrap();
+        cache
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn run_one_tick_dispatches_prop_signal_when_cache_set() {
+        // No regular markets, just a prop. Cache says big OVER edge.
+        let state = Arc::new(RwLock::new(FeatureState::default()));
+        let markets = Arc::new(RwLock::new(vec![]));
+        let signing = sample_signing_arc();
+        let risk = Arc::new(RiskLimits::new());
+        let client = make_client();
+        let positions = Arc::new(PositionStore::open(&temp_dir()).unwrap());
+        let last_submit = Arc::new(DashMap::new());
+
+        let cache = write_prop_cache(
+            0.65, 0.50, 0.49,
+            "0xPROP", "111", "222",
+        ).await;
+        let mut runner_cfg = RunnerConfig::default();
+        runner_cfg.projections_cache = Some(Arc::new(cache));
+
+        let mut sig_cfg = SignalConfig::default();
+        sig_cfg.min_window_age_secs = 0.0;
+
+        let r = run_one_tick(
+            &state, &markets, &signing, &risk, &RiskConfig::default(),
+            &sig_cfg, &client, &positions, &last_submit, &runner_cfg,
+            chrono::Utc::now().timestamp_millis() as u64,
+        ).await.unwrap();
+
+        // Prop signal fired → dispatched, executed in DRY_RUN
+        assert_eq!(r.len(), 1, "expected 1 prop signal, got {:?}", r);
+        assert_eq!(r[0].0, "0xPROP");
+        assert_eq!(r[0].1, "submitted");
+        assert_eq!(positions.len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn no_prop_cache_means_no_prop_signals() {
+        let state = Arc::new(RwLock::new(FeatureState::default()));
+        let markets = Arc::new(RwLock::new(vec![]));
+        let signing = sample_signing_arc();
+        let risk = Arc::new(RiskLimits::new());
+        let client = make_client();
+        let positions = Arc::new(PositionStore::open(&temp_dir()).unwrap());
+        let last_submit = Arc::new(DashMap::new());
+        let runner_cfg = RunnerConfig::default();   // projections_cache: None
+
+        let r = run_one_tick(
+            &state, &markets, &signing, &risk, &RiskConfig::default(),
+            &SignalConfig::default(), &client, &positions, &last_submit, &runner_cfg,
+            chrono::Utc::now().timestamp_millis() as u64,
+        ).await.unwrap();
+        assert!(r.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn prop_cooldown_blocks_repeat_within_window() {
+        let state = Arc::new(RwLock::new(FeatureState::default()));
+        let markets = Arc::new(RwLock::new(vec![]));
+        let signing = sample_signing_arc();
+        let risk = Arc::new(RiskLimits::new());
+        let client = make_client();
+        let positions = Arc::new(PositionStore::open(&temp_dir()).unwrap());
+        let last_submit = Arc::new(DashMap::new());
+
+        let cache = write_prop_cache(0.65, 0.50, 0.49, "0xPROP", "111", "222").await;
+        let mut runner_cfg = RunnerConfig::default();
+        runner_cfg.projections_cache = Some(Arc::new(cache));
+        let mut sig_cfg = SignalConfig::default();
+        sig_cfg.min_window_age_secs = 0.0;
+
+        let now = chrono::Utc::now().timestamp_millis() as u64;
+        // First tick: fires
+        let r1 = run_one_tick(
+            &state, &markets, &signing, &risk, &RiskConfig::default(),
+            &sig_cfg, &client, &positions, &last_submit, &runner_cfg, now,
+        ).await.unwrap();
+        assert_eq!(r1.len(), 1);
+        // Second tick within cooldown: skipped
+        let r2 = run_one_tick(
+            &state, &markets, &signing, &risk, &RiskConfig::default(),
+            &sig_cfg, &client, &positions, &last_submit, &runner_cfg, now + 5_000,
+        ).await.unwrap();
+        assert!(r2.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn synthetic_market_does_not_fire_oracle_path() {
+        // Verify the safety property: synthetic prop markets get added to
+        // markets_snapshot, but evaluate_all_markets shouldn't fire on
+        // them (state.asset_books is empty for prop tokens).
+        // Prop p_over below MIN_EDGE → prop path won't fire either.
+        let state = Arc::new(RwLock::new(FeatureState::default()));
+        let markets = Arc::new(RwLock::new(vec![]));
+        let signing = sample_signing_arc();
+        let risk = Arc::new(RiskLimits::new());
+        let client = make_client();
+        let positions = Arc::new(PositionStore::open(&temp_dir()).unwrap());
+        let last_submit = Arc::new(DashMap::new());
+
+        // Cache row that's too contested for prop signal to fire (model
+        // = 0.52, market = 0.50 → 2pp edge < 7pp MIN_EDGE)
+        let cache = write_prop_cache(0.52, 0.50, 0.49, "0xPROP", "111", "222").await;
+        let mut runner_cfg = RunnerConfig::default();
+        runner_cfg.projections_cache = Some(Arc::new(cache));
+        let mut sig_cfg = SignalConfig::default();
+        sig_cfg.min_window_age_secs = 0.0;
+
+        let r = run_one_tick(
+            &state, &markets, &signing, &risk, &RiskConfig::default(),
+            &sig_cfg, &client, &positions, &last_submit, &runner_cfg,
+            chrono::Utc::now().timestamp_millis() as u64,
+        ).await.unwrap();
+        // No oracle/intramarket signal (no books for the synthetic market),
+        // no prop signal (edge below threshold) → empty.
+        assert!(r.is_empty(), "expected empty dispatch, got {:?}", r);
     }
 }
