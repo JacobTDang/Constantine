@@ -120,6 +120,10 @@ pub(crate) fn update_history(state: &mut FeatureState, event: StreamEvent) {
             if price > 0.0 {
                 state.chainlink_price = price;
                 state.last_chainlink_update_ms = now_ms;
+                // G1: keep a rolling history so settlement can pick the
+                // price NEAREST to close_time, not just the latest reading.
+                state.chainlink_history.push_back((now_ms, price));
+                trim_ts(&mut state.chainlink_history, now_ms, 30 * 60_000);
             }
         }
 

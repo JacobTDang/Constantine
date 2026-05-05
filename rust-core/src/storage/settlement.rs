@@ -6,7 +6,7 @@
 // happens at analysis time in scripts/observe_report.py. The live process
 // only appends, never updates.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -17,6 +17,42 @@ use tokio::time::{Duration, MissedTickBehavior};
 use crate::features::FeatureState;
 use crate::streams::polymarket::PolyMarket;
 use super::{Position, PositionStatus, PositionStore, SettlementRow, SignalLog};
+
+// ── G1: pick chainlink price nearest to a target timestamp ────────────────────
+//
+// Settlement should use the chainlink reading at-or-near close_time_ms,
+// NOT the latest reading (which may be 30-60s after close on a 5s polling
+// cadence). Wrong sample → wrong outcome direction → wrong P&L
+// attribution → wrong feedback to the slippage tracker.
+
+/// Window inside which we consider a sample "close enough" to the target.
+/// 60s covers the chainlink polling cadence (5s) plus a comfortable slop
+/// for clock drift and missed ticks.
+const SETTLEMENT_NEAREST_WINDOW_MS: u64 = 60_000;
+
+/// Find the chainlink sample closest in time to `target_ms` within
+/// SETTLEMENT_NEAREST_WINDOW_MS. Returns None if no sample is close enough.
+///
+/// Rationale: the buffer is in chronological order, so we could binary
+/// search — but at typical sizes (a few hundred entries) a linear scan is
+/// fast and avoids the off-by-one bugs that creep in with manual binary
+/// search. Cost is O(n) but n is bounded by CHAINLINK_HIST = 400.
+pub fn nearest_chainlink_to(
+    history:   &VecDeque<(u64, f64)>,
+    target_ms: u64,
+) -> Option<f64> {
+    let mut best: Option<(u64, f64)> = None;   // (delta, price)
+    for &(ts, price) in history {
+        let delta = ts.abs_diff(target_ms);
+        if delta > SETTLEMENT_NEAREST_WINDOW_MS { continue; }
+        match best {
+            None => best = Some((delta, price)),
+            Some((bd, _)) if delta < bd => best = Some((delta, price)),
+            _ => {}
+        }
+    }
+    best.map(|(_, p)| p)
+}
 
 const POLL_INTERVAL_SECS: u64 = 2;
 
@@ -99,15 +135,16 @@ pub async fn settlement_monitor_loop(
 
         let markets_snapshot = markets.read().await.clone();
         let s = state.read().await;
-        let chainlink   = s.chainlink_price;
-        let strikes_now = s.window_strikes.clone();
+        let latest_chainlink = s.chainlink_price;
+        let strikes_now      = s.window_strikes.clone();
+        let chainlink_hist   = s.chainlink_history.clone();
         drop(s);
 
         for m in &markets_snapshot {
             if already_settled.contains(&m.id) || now_ms < m.close_time_ms {
                 continue;
             }
-            if chainlink <= 0.0 {
+            if latest_chainlink <= 0.0 {
                 continue;
             }
 
@@ -118,6 +155,21 @@ pub async fn settlement_monitor_loop(
                 continue;
             }
 
+            // G1: settle against the chainlink reading nearest to close_time,
+            // not the latest. Wrong sample → wrong outcome direction.
+            let chainlink = match nearest_chainlink_to(&chainlink_hist, m.close_time_ms) {
+                Some(p) => p,
+                None => {
+                    tracing::warn!(
+                        market = %m.id,
+                        close_time_ms = m.close_time_ms,
+                        latest = latest_chainlink,
+                        history_len = chainlink_hist.len(),
+                        "no chainlink sample within ±60s of close_time — falling back to latest"
+                    );
+                    latest_chainlink
+                }
+            };
             let outcome_up = chainlink > strike;
             let row = SettlementRow {
                 market_id:            m.id.clone(),
@@ -168,6 +220,70 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    // ── G1: nearest_chainlink_to ─────────────────────────────────────────
+
+    fn build_history(samples: &[(u64, f64)]) -> std::collections::VecDeque<(u64, f64)> {
+        samples.iter().copied().collect()
+    }
+
+    #[test]
+    fn nearest_returns_none_for_empty_history() {
+        let h = build_history(&[]);
+        assert_eq!(nearest_chainlink_to(&h, 1_000), None);
+    }
+
+    #[test]
+    fn nearest_returns_exact_match() {
+        let h = build_history(&[(1_000, 80_000.0), (5_000, 80_500.0)]);
+        assert_eq!(nearest_chainlink_to(&h, 5_000), Some(80_500.0));
+    }
+
+    #[test]
+    fn nearest_picks_closer_of_two_brackets() {
+        // Target = 4_500. Closer to 5_000 (delta 500) than to 1_000 (delta 3500).
+        let h = build_history(&[(1_000, 80_000.0), (5_000, 80_500.0)]);
+        assert_eq!(nearest_chainlink_to(&h, 4_500), Some(80_500.0));
+    }
+
+    #[test]
+    fn nearest_returns_none_when_no_sample_within_window() {
+        // Closest sample is 90s away from target; window is 60s.
+        let h = build_history(&[(0, 80_000.0), (180_000, 80_500.0)]);
+        assert_eq!(nearest_chainlink_to(&h, 90_000), None);
+    }
+
+    #[test]
+    fn nearest_includes_sample_at_window_boundary() {
+        // Sample exactly 60s before target → still inside window (<=).
+        let h = build_history(&[(0, 80_000.0)]);
+        assert_eq!(nearest_chainlink_to(&h, 60_000), Some(80_000.0));
+    }
+
+    #[test]
+    fn nearest_handles_target_in_the_past() {
+        // target_ms < some sample times → abs_diff still works.
+        let h = build_history(&[(10_000, 80_000.0), (20_000, 80_500.0)]);
+        assert_eq!(nearest_chainlink_to(&h, 15_000), Some(80_000.0));   // delta 5_000 either way; first wins
+    }
+
+    #[test]
+    fn settlement_uses_close_time_chainlink_when_available() {
+        // Real-world scenario: BTC dropped between t=5min (close) and
+        // t=5min30s (settlement_monitor_loop tick). Without G1 we'd
+        // settle Down; with G1 we settle Up correctly.
+        let strike = 80_000.0;
+        let close_ms = 300_000_u64;
+        let h = build_history(&[
+            (290_000, 80_100.0),   // 10s before close
+            (300_000, 80_050.0),   // AT close — Up wins
+            (310_000, 79_950.0),   // 10s after close
+            (330_000, 79_900.0),   // 30s after close — latest
+        ]);
+        let chainlink_at_close = nearest_chainlink_to(&h, close_ms).unwrap();
+        let outcome_up = chainlink_at_close > strike;
+        assert!(outcome_up, "should settle Up using close-time price 80050 > 80000");
     }
 
     // ── compute_paper_pnl ────────────────────────────────────────────────

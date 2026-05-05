@@ -19,8 +19,9 @@ pub struct BookState {
 
 // Capacities (in number of 1-minute candles unless noted)
 const HIST_60M:  usize = 60;   // 60 candles = 1 hour of 1-min history
-const OI_HIST:   usize = 120;  // ~2 min of OI ticks at 1-sec updates
-const LIQ_HIST:  usize = 1000; // up to 1000 liquidation events in the buffer
+const OI_HIST:        usize = 120;  // ~2 min of OI ticks at 1-sec updates
+const LIQ_HIST:       usize = 1000; // up to 1000 liquidation events in the buffer
+const CHAINLINK_HIST: usize = 400;  // ~33min @ 5s cadence — covers a 15-min window
 
 /// All feature values computed from the live stream, plus the raw history
 /// buffers needed to compute them. Updated every 500ms by the compute loop.
@@ -35,6 +36,11 @@ pub struct FeatureState {
     pub returns_1m:  RollingWindow<f64>,  // log returns between closes
     pub oi_history:  VecDeque<(u64, f64)>,              // (timestamp_ms, oi_btc)
     pub liq_history: VecDeque<(u64, LiqSide, f64)>,    // (timestamp_ms, side, qty)
+    /// G1: rolling buffer of (local_now_ms, chainlink_price) — used by
+    /// settlement to pick the price NEAREST to a market's close_time_ms,
+    /// not just the latest. Bounded to ~30min so we cover the longest
+    /// (15-min) window with margin. Polling cadence is 5s → ~360 samples.
+    pub chainlink_history: VecDeque<(u64, f64)>,
 
     // ── Polymarket per-market state (D5/D6) ───────────────────────────────
     pub asset_books:    HashMap<String, BookState>,    // asset_id -> latest book
@@ -110,8 +116,9 @@ impl Default for FeatureState {
             closes_1m:   RollingWindow::new(HIST_60M),
             volumes_1m:  RollingWindow::new(HIST_60M),
             returns_1m:  RollingWindow::new(HIST_60M),
-            oi_history:  VecDeque::with_capacity(OI_HIST),
-            liq_history: VecDeque::with_capacity(LIQ_HIST),
+            oi_history:        VecDeque::with_capacity(OI_HIST),
+            liq_history:       VecDeque::with_capacity(LIQ_HIST),
+            chainlink_history: VecDeque::with_capacity(CHAINLINK_HIST),
 
             asset_books:                  HashMap::new(),
             window_strikes:               HashMap::new(),
