@@ -1,5 +1,6 @@
 pub mod intramarket;
 pub mod oracle_arb;
+pub mod player_props;
 pub mod regime;
 
 use std::sync::Arc;
