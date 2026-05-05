@@ -1,0 +1,9 @@
+question,spike_date,pre_spike,spike_peak,resolved_yes,days_held,fade_pnl_pct
+Will Hezbollah conduct military action against Israel on March 31  2026?,2026-03-22,0.445,0.725,True,8,-1.000
+Israel strikes Iranian oil in June?,2025-06-14,0.215,0.800,True,16,-1.000
+Will Russia capture Zaliznychne by February 28?,2026-02-21,0.119,0.934,True,6,-1.000
+Israel strike on Tehran before July?,2025-06-13,0.260,0.560,True,17,-1.000
+Will Israel not strike Yemen by October 1 ET?,2025-09-27,0.470,0.810,True,3,-1.000
+Will Israel strike 2 countries in October 2025?,2025-10-26,0.085,0.320,False,4,0.471
+Military action against Iran ends by April 13  2026?,2026-04-09,0.345,0.700,True,20,-1.000
+Military action against Iran ends by April 21  2026?,2026-04-09,0.440,0.735,True,20,-1.000
