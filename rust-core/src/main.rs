@@ -6,6 +6,28 @@ use polymarket_bot::{
 };
 use polymarket_bot::features::FeatureState;
 
+/// EDGE-A: resolve a Polymarket condition_id to its (yes_token_id,
+/// no_token_id) pair via the public Gamma /markets endpoint. Returns
+/// None on any failure — discovery skips unresolvable markets.
+async fn resolve_condition_to_tokens(
+    http: &reqwest::Client,
+    condition_id: &str,
+) -> Option<(String, String)> {
+    let url = format!(
+        "https://gamma-api.polymarket.com/markets?condition_ids={}",
+        condition_id
+    );
+    let resp = http.get(&url).send().await.ok()?;
+    if !resp.status().is_success() { return None; }
+    let body = resp.text().await.ok()?;
+    let arr: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let market = arr.as_array()?.first()?;
+    let raw = market.get("clobTokenIds")?.as_str()?;
+    let tokens: Vec<String> = serde_json::from_str(raw).ok()?;
+    if tokens.len() != 2 { return None; }
+    Some((tokens[0].clone(), tokens[1].clone()))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
@@ -286,6 +308,52 @@ async fn main() -> anyhow::Result<()> {
                 tasks.spawn(execution::maintenance::periodic_reconcile_loop(
                     client.clone(), positions.clone(), maint_cfg,
                 ));
+
+                // EDGE-A: Liquidity rewards quoter. Off by default — flip
+                // LP_QUOTER_ENABLED=true after running Phase 0 backtest.
+                if c.lp_quoter_enabled {
+                    let lp_cfg = Arc::new(execution::lp_quoter::LpQuoterConfig {
+                        quote_size_usd:      c.lp_quote_size_usd,
+                        max_markets:         c.lp_max_markets,
+                        inventory_cap_usd:   c.lp_inventory_cap_usd,
+                        ..execution::lp_quoter::LpQuoterConfig::default()
+                    });
+                    let lp_cache = Arc::new(execution::lp_quoter::LpQuoterCache::default());
+                    let resolver_http = reqwest::Client::builder()
+                        .timeout(std::time::Duration::from_secs(15))
+                        .build()
+                        .expect("reqwest client build (lp resolver)");
+                    let resolver = Arc::new(move |condition_id: String| {
+                        let http = resolver_http.clone();
+                        Box::pin(async move {
+                            resolve_condition_to_tokens(&http, &condition_id).await
+                        }) as std::pin::Pin<Box<dyn std::future::Future<
+                            Output = Option<(String, String)>> + Send>>
+                    });
+                    tasks.spawn(execution::lp_quoter::lp_discovery_loop(
+                        lp_cache.clone(),
+                        lp_cfg.clone(),
+                        client.clone(),
+                        resolver,
+                        std::time::Duration::from_secs(3600),
+                    ));
+                    tasks.spawn(execution::lp_quoter::lp_quoter_loop(
+                        lp_cache,
+                        lp_cfg,
+                        risk_limits.clone(),
+                        signing.clone(),
+                        client.clone(),
+                        Some(positions.clone()),
+                        std::time::Duration::from_secs(c.lp_refresh_secs),
+                    ));
+                    tracing::info!(
+                        size_usd = c.lp_quote_size_usd,
+                        max_markets = c.lp_max_markets,
+                        cap_usd = c.lp_inventory_cap_usd,
+                        refresh_secs = c.lp_refresh_secs,
+                        "EDGE-A lp_quoter spawned"
+                    );
+                }
 
                 tasks.spawn(execution::runner::execution_runner_loop(
                     state.clone(),

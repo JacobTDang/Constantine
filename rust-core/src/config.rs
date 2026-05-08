@@ -41,6 +41,14 @@ pub struct Config {
     pub oracle_arb_threshold: f64,
     pub scan_interval_ms: u64,
 
+    // EDGE-A: liquidity-rewards quoter. Off by default; flip on after
+    // running Phase 0 backtest and confirming markets pass.
+    pub lp_quoter_enabled: bool,
+    pub lp_quote_size_usd: f64,
+    pub lp_max_markets:    usize,
+    pub lp_inventory_cap_usd: f64,
+    pub lp_refresh_secs:   u64,
+
     // Logging
     pub log_level: String,
 }
@@ -121,6 +129,11 @@ impl Config {
             min_liquidity:            f64_var("MIN_LIQUIDITY", 500.0)?,
             oracle_arb_threshold:     f64_var("ORACLE_ARB_THRESHOLD", 0.04)?,
             scan_interval_ms:         u64_var("SCAN_INTERVAL_MS", 500)?,
+            lp_quoter_enabled:        bool_var("LP_QUOTER_ENABLED", false)?,
+            lp_quote_size_usd:        f64_var("LP_QUOTE_SIZE_USD", 200.0)?,
+            lp_max_markets:           u64_var("LP_MAX_MARKETS", 5)? as usize,
+            lp_inventory_cap_usd:     f64_var("LP_INVENTORY_CAP_USD", 400.0)?,
+            lp_refresh_secs:          u64_var("LP_REFRESH_SECS", 5)?,
             log_level:                get("LOG_LEVEL").unwrap_or_else(|| "info".to_string()),
         })
     }

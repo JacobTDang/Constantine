@@ -3,6 +3,7 @@ pub mod clob;
 pub mod event_arb_executor;
 pub mod executor;
 pub mod kelly;
+pub mod lp_quoter;
 pub mod maintenance;
 pub mod orders;
 pub mod presign;

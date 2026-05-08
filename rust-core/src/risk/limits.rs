@@ -80,6 +80,7 @@ pub enum Strategy {
     Oracle,         // BTC oracle/intramarket arb (the original strategy)
     PlayerProps,    // Strategy 1: NBA player props
     EventArb,       // Strategy 2: event sum-of-YES arb
+    LpRewards,      // EDGE-A: liquidity rewards market making
 }
 
 /// Per-strategy gates so a bug in one strategy doesn't halt the others.
@@ -89,6 +90,7 @@ pub struct StrategyKills {
     pub oracle:       AtomicBool,
     pub player_props: AtomicBool,
     pub event_arb:    AtomicBool,
+    pub lp_rewards:   AtomicBool,
 }
 
 #[derive(Debug)]
@@ -331,6 +333,7 @@ impl RiskLimits {
             Strategy::Oracle       => self.strategy.oracle.store(true, Ordering::SeqCst),
             Strategy::PlayerProps  => self.strategy.player_props.store(true, Ordering::SeqCst),
             Strategy::EventArb     => self.strategy.event_arb.store(true, Ordering::SeqCst),
+            Strategy::LpRewards    => self.strategy.lp_rewards.store(true, Ordering::SeqCst),
         }
     }
 
@@ -339,6 +342,7 @@ impl RiskLimits {
             Strategy::Oracle       => self.strategy.oracle.store(false, Ordering::SeqCst),
             Strategy::PlayerProps  => self.strategy.player_props.store(false, Ordering::SeqCst),
             Strategy::EventArb     => self.strategy.event_arb.store(false, Ordering::SeqCst),
+            Strategy::LpRewards    => self.strategy.lp_rewards.store(false, Ordering::SeqCst),
         }
     }
 
@@ -347,6 +351,7 @@ impl RiskLimits {
             Strategy::Oracle       => self.strategy.oracle.load(Ordering::SeqCst),
             Strategy::PlayerProps  => self.strategy.player_props.load(Ordering::SeqCst),
             Strategy::EventArb     => self.strategy.event_arb.load(Ordering::SeqCst),
+            Strategy::LpRewards    => self.strategy.lp_rewards.load(Ordering::SeqCst),
         }
     }
 

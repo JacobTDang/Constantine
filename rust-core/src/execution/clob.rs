@@ -39,8 +39,15 @@ use crate::execution::orders::{
 
 pub const POLYMARKET_CLOB_BASE_URL: &str = "https://clob.polymarket.com";
 pub const ORDER_PATH:                &str = "/order";
+pub const ORDERS_BULK_PATH:          &str = "/orders";
 pub const DATA_ORDERS_PATH:          &str = "/data/orders";
 pub const DATA_TRADES_PATH:          &str = "/data/trades";
+pub const CANCEL_MARKET_PATH:        &str = "/cancel-market-orders";
+pub const BOOK_PATH:                 &str = "/book";
+pub const REWARDS_CURRENT_PATH:      &str = "/rewards/markets/current";
+
+/// Max orders Polymarket accepts per bulk submit (postOrders endpoint).
+pub const MAX_BULK_ORDERS: usize = 15;
 
 /// Polymarket time-in-force values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -381,6 +388,214 @@ impl ClobClient {
         anyhow::bail!("cancel HTTP {}", status);
     }
 
+    // ── EDGE-A: bulk cancel by market_id ─────────────────────────────────
+
+    /// Cancel ALL of our open orders on a single market. Used by the LP
+    /// quoter when the inventory cap trips or the market exits the
+    /// rewards programme. DRY_RUN short-circuits to Ok(0).
+    pub async fn cancel_orders_by_market(&self, market_id: &str) -> Result<usize> {
+        if self.cfg.dry_run {
+            tracing::info!(market_id, "DRY_RUN: would cancel-by-market");
+            return Ok(0);
+        }
+        if market_id.is_empty() {
+            anyhow::bail!("cancel_orders_by_market: empty market_id");
+        }
+        let body = serde_json::json!({"market": market_id}).to_string();
+        let url = format!("{}{}", self.cfg.base_url, CANCEL_MARKET_PATH);
+        let headers = auth_headers_now(
+            &self.cfg.address,
+            &self.cfg.creds,
+            "POST",
+            CANCEL_MARKET_PATH,
+            &body,
+        ).context("auth_headers_now (cancel-market)")?;
+        let mut req = self.http
+            .post(&url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body);
+        for (k, v) in &headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
+        let resp = req.send().await.context("cancel-market send")?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if status.is_success() {
+            // Polymarket returns {"canceled":[ids], "not_canceled":{...}}.
+            // Count what we got back if parseable; fall back to 0.
+            #[derive(Deserialize)]
+            struct Resp { #[serde(default)] canceled: Vec<String> }
+            let n = serde_json::from_str::<Resp>(&text)
+                .map(|r| r.canceled.len())
+                .unwrap_or(0);
+            return Ok(n);
+        }
+        if status.is_client_error() {
+            tracing::debug!(market_id, status = status.as_u16(),
+                body = %truncate(&text, 200), "cancel-market 4xx");
+            return Ok(0);
+        }
+        anyhow::bail!("cancel-market HTTP {}: {}", status, truncate(&text, 200));
+    }
+
+    // ── EDGE-A: bulk order submit (postOrders, up to 15 per call) ────────
+
+    /// Submit up to MAX_BULK_ORDERS pre-signed orders in one POST. Each
+    /// entry can have its own OrderType / post_only — useful for posting
+    /// both bid and ask of every quoted market in a single call.
+    /// DRY_RUN logs each and returns a vector of dry-run outcomes.
+    pub async fn submit_orders_bulk(
+        &self,
+        entries: &[(SignedOrder, OrderType, Option<bool>)],
+    ) -> Result<Vec<SubmitOutcome>> {
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+        if entries.len() > MAX_BULK_ORDERS {
+            anyhow::bail!("submit_orders_bulk: {} > MAX_BULK_ORDERS ({})",
+                          entries.len(), MAX_BULK_ORDERS);
+        }
+        if self.cfg.dry_run {
+            for (signed, ot, _po) in entries {
+                tracing::info!(
+                    salt = %u256_to_dec(&signed.order.salt),
+                    token_id = %u256_to_dec(&signed.order.token_id),
+                    side = ?signed.order.side,
+                    order_type = ot.as_str(),
+                    "DRY_RUN: would bulk-submit",
+                );
+            }
+            return Ok(entries.iter().map(|_| SubmitOutcome::dry_run()).collect());
+        }
+
+        // Build the array body. Polymarket's /orders endpoint accepts
+        // an array of the same shape as /order's body.
+        let bodies: Result<Vec<SubmitBody>> = entries
+            .iter()
+            .map(|(signed, ot, po)| build_submit_body(
+                signed, &self.cfg.creds.api_key, *ot, *po))
+            .collect();
+        let bodies = bodies?;
+        let body_str = serde_json::to_string(&bodies).context("serialize bulk")?;
+
+        let url = format!("{}{}", self.cfg.base_url, ORDERS_BULK_PATH);
+        let headers = auth_headers_now(
+            &self.cfg.address,
+            &self.cfg.creds,
+            "POST",
+            ORDERS_BULK_PATH,
+            &body_str,
+        ).context("auth_headers_now (bulk)")?;
+        let mut req = self.http
+            .post(&url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body_str);
+        for (k, v) in &headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
+        let resp = req.send().await.context("bulk submit send")?;
+        let http_status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        if !(200..300).contains(&http_status) {
+            // Treat as all-failed rather than panicking.
+            tracing::warn!(http_status, body = %truncate(&text, 300),
+                "bulk submit non-2xx");
+            return Ok(entries.iter().map(|_| SubmitOutcome {
+                success:     false,
+                order_id:    String::new(),
+                status:      String::new(),
+                error_msg:   format!("HTTP {}: {}", http_status, truncate(&text, 200)),
+                http_status,
+                dry_run:     false,
+                attempts:    1,
+            }).collect());
+        }
+        // Polymarket returns either an array of ClobApiResponse OR an object
+        // wrapping one. We accept both shapes.
+        let parsed: Vec<ClobApiResponse> = match serde_json::from_str(&text) {
+            Ok(v) => v,
+            Err(_) => {
+                let one: ClobApiResponse = serde_json::from_str(&text)
+                    .with_context(|| format!("parse bulk response: {}", truncate(&text, 200)))?;
+                vec![one]
+            }
+        };
+        Ok(parsed.into_iter().map(|p| SubmitOutcome {
+            success:     p.success,
+            order_id:    p.order_id,
+            status:      p.status,
+            error_msg:   p.error_msg,
+            http_status,
+            dry_run:     false,
+            attempts:    1,
+        }).collect())
+    }
+
+    // ── EDGE-A: public read endpoints (no auth) ──────────────────────────
+
+    /// Fetch the public order book for one token_id. Returns top-of-book
+    /// via best_bid / best_ask helpers; full ladder via bids / asks.
+    pub async fn fetch_book(&self, token_id: &str) -> Result<BookSnapshot> {
+        let url = format!("{}{}?token_id={}", self.cfg.base_url, BOOK_PATH, token_id);
+        let resp = self.http.get(&url).send().await.context("book GET")?;
+        let status = resp.status();
+        let text = resp.text().await.context("book body read")?;
+        if !status.is_success() {
+            anyhow::bail!("book HTTP {}: {}", status, truncate(&text, 200));
+        }
+        let raw: BookWire = serde_json::from_str(&text)
+            .with_context(|| format!("parse book: {}", truncate(&text, 200)))?;
+        Ok(raw.into_snapshot(token_id.to_string()))
+    }
+
+    /// Fetch active reward configs sorted by daily rate. Public, no auth.
+    /// Used by the LP rewards strategy to discover which markets to quote.
+    pub async fn fetch_active_rewards(&self, max_markets: usize) -> Result<Vec<RewardMarket>> {
+        let mut out: Vec<RewardMarket> = Vec::new();
+        let mut next_cursor: Option<String> = None;
+        loop {
+            let qs = match &next_cursor {
+                Some(c) => format!("?limit=500&next_cursor={}", c),
+                None    => "?limit=500".to_string(),
+            };
+            let url = format!("{}{}{}", self.cfg.base_url, REWARDS_CURRENT_PATH, qs);
+            let resp = self.http.get(&url).send().await.context("rewards GET")?;
+            let status = resp.status();
+            let text = resp.text().await.context("rewards body read")?;
+            if !status.is_success() {
+                anyhow::bail!("rewards HTTP {}: {}", status, truncate(&text, 200));
+            }
+            let page: RewardsPage = serde_json::from_str(&text)
+                .with_context(|| format!("parse rewards: {}", truncate(&text, 200)))?;
+            for row in page.data {
+                let rate_per_day = row.rewards_config.first()
+                    .map(|c| c.rate_per_day)
+                    .unwrap_or(0.0);
+                if rate_per_day <= 0.0 { continue; }
+                out.push(RewardMarket {
+                    condition_id:       row.condition_id,
+                    rewards_max_spread: row.rewards_max_spread,
+                    rewards_min_size:   row.rewards_min_size,
+                    rate_per_day,
+                    sponsored_daily_rate: row.sponsored_daily_rate.unwrap_or(0.0),
+                });
+                if out.len() >= max_markets { break; }
+            }
+            if out.len() >= max_markets { break; }
+            match page.next_cursor {
+                Some(c) if c != "LTE=" => next_cursor = Some(c),
+                _ => break,
+            }
+        }
+        out.sort_by(|a, b| {
+            (b.rate_per_day + b.sponsored_daily_rate)
+                .partial_cmp(&(a.rate_per_day + a.sponsored_daily_rate))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        out.truncate(max_markets);
+        Ok(out)
+    }
+
     // ── G13: Read-side endpoints for startup reconciliation ─────────────
 
     /// Fetch the open orders Polymarket has on file for `owner`.
@@ -500,6 +715,99 @@ impl PolyTrade {
     /// input rather than failing — reconciliation must degrade gracefully.
     pub fn price_f64(&self) -> Option<f64> { self.price.parse().ok() }
     pub fn size_f64(&self)  -> Option<f64> { self.size.parse().ok()  }
+}
+
+// ── EDGE-A: Order book + rewards schemas ────────────────────────────────────
+
+/// Public order book snapshot for one token. Levels are sorted: bids
+/// best-first (highest price), asks best-first (lowest price).
+#[derive(Debug, Clone)]
+pub struct BookSnapshot {
+    pub token_id: String,
+    pub bids:     Vec<(f64, f64)>,   // (price, size)
+    pub asks:     Vec<(f64, f64)>,
+}
+
+impl BookSnapshot {
+    pub fn best_bid(&self) -> Option<f64> { self.bids.first().map(|(p, _)| *p) }
+    pub fn best_ask(&self) -> Option<f64> { self.asks.first().map(|(p, _)| *p) }
+    pub fn mid(&self) -> Option<f64> {
+        match (self.best_bid(), self.best_ask()) {
+            (Some(b), Some(a)) if a >= b => Some((a + b) / 2.0),
+            _ => None,
+        }
+    }
+    pub fn spread(&self) -> Option<f64> {
+        match (self.best_bid(), self.best_ask()) {
+            (Some(b), Some(a)) if a >= b => Some(a - b),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct BookWire {
+    #[serde(default)] bids: Vec<BookLevelWire>,
+    #[serde(default)] asks: Vec<BookLevelWire>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BookLevelWire {
+    #[serde(default)] price: String,
+    #[serde(default)] size:  String,
+}
+
+impl BookWire {
+    fn into_snapshot(self, token_id: String) -> BookSnapshot {
+        fn parse_levels(raw: Vec<BookLevelWire>) -> Vec<(f64, f64)> {
+            raw.into_iter()
+                .filter_map(|l| {
+                    let p = l.price.parse::<f64>().ok()?;
+                    let s = l.size.parse::<f64>().ok()?;
+                    if p <= 0.0 || s <= 0.0 { return None; }
+                    Some((p, s))
+                })
+                .collect()
+        }
+        let mut bids = parse_levels(self.bids);
+        let mut asks = parse_levels(self.asks);
+        bids.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        asks.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        BookSnapshot { token_id, bids, asks }
+    }
+}
+
+/// One market's reward configuration as returned by /rewards/markets/current.
+#[derive(Debug, Clone)]
+pub struct RewardMarket {
+    pub condition_id:         String,
+    /// Max spread in cents (e.g. 3.5 = 3.5 cents).
+    pub rewards_max_spread:   f64,
+    /// Minimum order size in USD.
+    pub rewards_min_size:     f64,
+    /// Native daily reward pool USDC.
+    pub rate_per_day:         f64,
+    pub sponsored_daily_rate: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct RewardsPage {
+    #[serde(default)] data:        Vec<RewardRowWire>,
+    #[serde(default)] next_cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RewardRowWire {
+    condition_id:         String,
+    #[serde(default)] rewards_max_spread: f64,
+    #[serde(default)] rewards_min_size:   f64,
+    #[serde(default)] rewards_config:     Vec<RewardCfgWire>,
+    #[serde(default)] sponsored_daily_rate: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RewardCfgWire {
+    #[serde(default)] rate_per_day: f64,
 }
 
 // ── Wire conversion ──────────────────────────────────────────────────────────
@@ -968,5 +1276,138 @@ mod tests {
         let cfg = ClobConfig::new(TEST_ADDR, sample_creds(), false);
         let client = ClobClient::new(cfg).unwrap();
         assert!(client.cancel_order("").await.is_err());
+    }
+
+    // ── EDGE-A tests: cancel-by-market, bulk submit, book, rewards ──────────
+
+    #[tokio::test]
+    async fn cancel_by_market_dry_run_returns_zero() {
+        let cfg = ClobConfig::new(TEST_ADDR, sample_creds(), true);
+        let client = ClobClient::new(cfg).unwrap();
+        let n = client.cancel_orders_by_market("0xCONDITION").await.unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[tokio::test]
+    async fn cancel_by_market_rejects_empty() {
+        let cfg = ClobConfig::new(TEST_ADDR, sample_creds(), false);
+        let client = ClobClient::new(cfg).unwrap();
+        assert!(client.cancel_orders_by_market("").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn bulk_submit_dry_run_returns_one_outcome_per_entry() {
+        let cfg = ClobConfig::new(TEST_ADDR, sample_creds(), true);
+        let client = ClobClient::new(cfg).unwrap();
+        let entries = vec![
+            (sample_signed(), OrderType::Gtc, Some(true)),
+            (sample_signed(), OrderType::Gtc, Some(true)),
+            (sample_signed(), OrderType::Gtc, Some(true)),
+        ];
+        let outcomes = client.submit_orders_bulk(&entries).await.unwrap();
+        assert_eq!(outcomes.len(), 3);
+        for o in outcomes {
+            assert!(o.dry_run);
+        }
+    }
+
+    #[tokio::test]
+    async fn bulk_submit_rejects_oversize_batch() {
+        let cfg = ClobConfig::new(TEST_ADDR, sample_creds(), true);
+        let client = ClobClient::new(cfg).unwrap();
+        let too_many: Vec<_> = (0..MAX_BULK_ORDERS + 1)
+            .map(|_| (sample_signed(), OrderType::Gtc, None))
+            .collect();
+        assert!(client.submit_orders_bulk(&too_many).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn bulk_submit_empty_input_returns_empty() {
+        let cfg = ClobConfig::new(TEST_ADDR, sample_creds(), true);
+        let client = ClobClient::new(cfg).unwrap();
+        let out = client.submit_orders_bulk(&[]).await.unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn book_wire_parses_levels_and_sorts() {
+        // Bids should be best-first (highest), asks should be best-first (lowest)
+        let raw = r#"{
+            "bids": [{"price": "0.49", "size": "100"}, {"price": "0.50", "size": "200"}],
+            "asks": [{"price": "0.55", "size": "50"}, {"price": "0.52", "size": "150"}]
+        }"#;
+        let wire: BookWire = serde_json::from_str(raw).unwrap();
+        let snap = wire.into_snapshot("tok123".to_string());
+        assert_eq!(snap.best_bid(), Some(0.50));
+        assert_eq!(snap.best_ask(), Some(0.52));
+        assert!(snap.mid().is_some());
+        let mid = snap.mid().unwrap();
+        assert!((mid - 0.51).abs() < 1e-9);
+        assert!((snap.spread().unwrap() - 0.02).abs() < 1e-9);
+    }
+
+    #[test]
+    fn book_wire_skips_zero_or_negative_levels() {
+        let raw = r#"{
+            "bids": [{"price": "0", "size": "100"}, {"price": "0.50", "size": "0"}, {"price": "0.49", "size": "100"}],
+            "asks": []
+        }"#;
+        let wire: BookWire = serde_json::from_str(raw).unwrap();
+        let snap = wire.into_snapshot("tok".to_string());
+        assert_eq!(snap.bids.len(), 1);
+        assert_eq!(snap.bids[0].0, 0.49);
+        assert!(snap.best_ask().is_none());
+        assert!(snap.mid().is_none());
+    }
+
+    #[test]
+    fn book_snapshot_handles_crossed_book() {
+        // If bid > ask (crossed), mid + spread return None to signal junk data
+        let snap = BookSnapshot {
+            token_id: "x".to_string(),
+            bids: vec![(0.60, 100.0)],
+            asks: vec![(0.55, 100.0)],
+        };
+        assert!(snap.mid().is_none());
+        assert!(snap.spread().is_none());
+    }
+
+    #[test]
+    fn rewards_page_parses_with_minimal_fields() {
+        let raw = r#"{
+            "data": [
+                {
+                    "condition_id": "0xABC",
+                    "rewards_max_spread": 3.5,
+                    "rewards_min_size": 200.0,
+                    "rewards_config": [{"rate_per_day": 4000.0}]
+                }
+            ],
+            "next_cursor": "LTE="
+        }"#;
+        let page: RewardsPage = serde_json::from_str(raw).unwrap();
+        assert_eq!(page.data.len(), 1);
+        assert_eq!(page.data[0].condition_id, "0xABC");
+        assert_eq!(page.data[0].rewards_config[0].rate_per_day, 4000.0);
+    }
+
+    #[test]
+    fn rewards_page_skips_zero_rate_rows() {
+        // Simulate the filter applied inside fetch_active_rewards
+        let raw = r#"{
+            "data": [
+                {"condition_id": "0xA", "rewards_max_spread": 3.5, "rewards_min_size": 200.0,
+                 "rewards_config": [{"rate_per_day": 100.0}]},
+                {"condition_id": "0xB", "rewards_max_spread": 3.5, "rewards_min_size": 200.0,
+                 "rewards_config": []}
+            ]
+        }"#;
+        let page: RewardsPage = serde_json::from_str(raw).unwrap();
+        let mut keep = 0;
+        for row in page.data {
+            let rate = row.rewards_config.first().map(|c| c.rate_per_day).unwrap_or(0.0);
+            if rate > 0.0 { keep += 1; }
+        }
+        assert_eq!(keep, 1);
     }
 }
