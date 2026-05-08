@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod clob;
+pub mod event_arb_executor;
 pub mod executor;
 pub mod kelly;
 pub mod orders;

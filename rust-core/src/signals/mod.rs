@@ -1,3 +1,4 @@
+pub mod event_arb;
 pub mod intramarket;
 pub mod oracle_arb;
 pub mod player_props;

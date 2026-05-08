@@ -28,9 +28,11 @@ use tokio::time::{Duration, MissedTickBehavior};
 use std::path::PathBuf;
 
 use crate::execution::clob::ClobClient;
+use crate::execution::event_arb_executor::{execute_event_arb, EventArbConfig};
 use crate::execution::executor::{execute_signal, ExecContext, SigningParams};
 use crate::features::FeatureState;
 use crate::risk::limits::{RiskConfig, RiskLimits};
+use crate::signals::event_arb::EventArbCache;
 use crate::signals::player_props::{evaluate_all_props, ProjectionsCache};
 use crate::signals::{evaluate_all_markets, SignalConfig, SignalDecision};
 use crate::storage::PositionStore;
@@ -55,6 +57,12 @@ pub struct RunnerConfig {
     pub projections_cache:        Option<Arc<ProjectionsCache>>,
     pub projections_path:         Option<PathBuf>,
     pub projections_reload_secs:  u64,
+    /// Strategy 2 — Event sum-of-YES arb. When set, runner periodically
+    /// dispatches portfolios from the cache. Cache is populated by a
+    /// background scanner task (caller's responsibility).
+    pub event_arb_cache:          Option<Arc<EventArbCache>>,
+    pub event_arb_cooldown_secs:  u64,
+    pub event_arb_cfg:            EventArbConfig,
 }
 
 impl Default for RunnerConfig {
@@ -65,6 +73,12 @@ impl Default for RunnerConfig {
             projections_cache:        None,
             projections_path:         None,
             projections_reload_secs:  30,
+            event_arb_cache:          None,
+            event_arb_cooldown_secs:  3600,    // 1h between portfolio attempts
+            event_arb_cfg:            EventArbConfig {
+                event_budget_usd: 60.0,
+                min_leg_dollars:  5.0,
+            },
         }
     }
 }
@@ -142,6 +156,33 @@ pub async fn execution_runner_loop(
         // Strategy 1: append prop signals from the projections cache.
         if let Some(cache) = runner_cfg.projections_cache.as_ref() {
             decisions.extend(evaluate_all_props(cache));
+        }
+
+        // Strategy 2: dispatch any event-arb portfolios in cache. Each
+        // portfolio dispatch is one event_id with its own cooldown.
+        // Spawn so HTTP submits run concurrently with the main tick.
+        if let Some(cache) = runner_cfg.event_arb_cache.as_ref() {
+            for edge in cache.snapshot() {
+                // Per-event cooldown to avoid re-submitting on every tick.
+                let key = format!("event-arb::{}", edge.event_id);
+                if let Some(last) = last_submit.get(&key) {
+                    let dt = now_ms.saturating_sub(*last);
+                    if dt < runner_cfg.event_arb_cooldown_secs * 1000 { continue; }
+                }
+                last_submit.insert(key, now_ms);
+
+                let cfg     = runner_cfg.event_arb_cfg;
+                let r2      = risk.clone();
+                let cl      = client.clone();
+                let pos     = positions.clone();
+                let sg      = signing.clone();
+                let rcfg    = risk_cfg;
+                tokio::spawn(async move {
+                    let _ = execute_event_arb(
+                        &edge, &cfg, &r2, &rcfg, &sg, &cl, Some(&pos),
+                    ).await;
+                });
+            }
         }
 
         // Dispatch every fired signal as an independent tokio task.
@@ -442,13 +483,7 @@ mod tests {
         let last_submit = Arc::new(DashMap::new());
         let mut sig_cfg = SignalConfig::default();
         sig_cfg.min_window_age_secs = 0.0;
-        let runner_cfg = RunnerConfig {
-            min_market_cooldown_secs: 60,
-            max_concurrent_submits:   8,
-            projections_cache:        None,
-            projections_path:         None,
-            projections_reload_secs:  30,
-        };
+        let runner_cfg = RunnerConfig::default();
 
         // First tick — 2 submits
         let r1 = run_one_tick(

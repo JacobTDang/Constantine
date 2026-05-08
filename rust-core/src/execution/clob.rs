@@ -211,14 +211,27 @@ impl ClobClient {
 
     pub fn config(&self) -> &ClobConfig { &self.cfg }
 
-    /// Submit a pre-signed order. In DRY_RUN this returns a synthetic success
-    /// without ever touching the network.
+    /// Submit a pre-signed order using the configured default OrderType
+    /// (FAK for short-window directional trades). Strategy 2 callers
+    /// should use `submit_order_as` to override with GTC for maker fills.
     pub async fn submit_order(&self, signed: &SignedOrder) -> Result<SubmitOutcome> {
+        self.submit_order_as(signed, self.cfg.order_type, self.cfg.post_only).await
+    }
+
+    /// Submit a pre-signed order with an EXPLICIT time-in-force.
+    /// Strategy 2 (event sum-of-YES arb) uses GTC so legs rest as
+    /// makers and earn the spread instead of paying taker fees.
+    pub async fn submit_order_as(
+        &self,
+        signed:     &SignedOrder,
+        order_type: OrderType,
+        post_only:  Option<bool>,
+    ) -> Result<SubmitOutcome> {
         let body = build_submit_body(
             signed,
             &self.cfg.creds.api_key,
-            self.cfg.order_type,
-            self.cfg.post_only,
+            order_type,
+            post_only,
         )?;
         let body_str = serde_json::to_string(&body).context("serialize order body")?;
 
@@ -320,6 +333,52 @@ impl ClobClient {
             dry_run:     false,
             attempts:    total_attempts,
         })
+    }
+
+    // ── Strategy 2: cancel a resting limit order ────────────────────────
+
+    /// Cancel an open (resting) limit order by Polymarket order_id.
+    /// Returns Ok(true) on success, Ok(false) if the order was already
+    /// filled / cancelled / not-found (server returns 4xx). DRY_RUN
+    /// returns Ok(true) without network.
+    pub async fn cancel_order(&self, order_id: &str) -> Result<bool> {
+        if self.cfg.dry_run {
+            tracing::info!(order_id, "DRY_RUN: would cancel");
+            return Ok(true);
+        }
+        if order_id.is_empty() {
+            anyhow::bail!("cancel: empty order_id");
+        }
+        // Polymarket: POST /order/cancel with body {"orderID": "<id>"}
+        let path = "/order/cancel";
+        let body = serde_json::json!({"orderID": order_id}).to_string();
+        let url = format!("{}{}", self.cfg.base_url, path);
+        let headers = auth_headers_now(
+            &self.cfg.address,
+            &self.cfg.creds,
+            "POST",
+            path,
+            &body,
+        ).context("auth_headers_now (cancel)")?;
+        let mut req = self.http
+            .post(&url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body);
+        for (k, v) in &headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
+        let resp = req.send().await.context("cancel send")?;
+        let status = resp.status();
+        if status.is_success() { return Ok(true); }
+        // 4xx — could be "already cancelled" or "already filled"; treat as
+        // false rather than error so callers can move on.
+        if status.is_client_error() {
+            let body = resp.text().await.unwrap_or_default();
+            tracing::debug!(order_id, status = status.as_u16(), body = %truncate(&body, 200),
+                "cancel got 4xx (likely already gone)");
+            return Ok(false);
+        }
+        anyhow::bail!("cancel HTTP {}", status);
     }
 
     // ── G13: Read-side endpoints for startup reconciliation ─────────────
@@ -806,5 +865,108 @@ mod tests {
         assert!(!outcome.success);
         assert_eq!(outcome.attempts, 3);   // 1 + 2 retries
         assert!(outcome.error_msg.contains("502"));
+    }
+
+    // ── Strategy 2: GTC submit + cancel ──────────────────────────────────
+
+    #[tokio::test]
+    async fn submit_order_as_uses_explicit_order_type() {
+        // Verifies submit_order_as overrides the cfg default. Mock returns
+        // the request body so we can inspect the orderType field.
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let received: std::sync::Arc<tokio::sync::Mutex<Option<String>>> =
+            std::sync::Arc::new(tokio::sync::Mutex::new(None));
+        let r2 = received.clone();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 16384];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                *r2.lock().await = Some(req);
+                let body = r#"{"success":true,"orderID":"0xok","status":"live"}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
+                    body.len(), body,
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+        let mut cfg = ClobConfig::new(TEST_ADDR, sample_creds(), false);
+        cfg.base_url = format!("http://{}", addr);
+        cfg.max_retries = 0;
+        cfg.order_type = OrderType::Fak;   // default = FAK
+        let client = ClobClient::new(cfg).unwrap();
+        // Override to GTC
+        let _ = client.submit_order_as(
+            &sample_signed(), OrderType::Gtc, None,
+        ).await.unwrap();
+        let req_text = received.lock().await.clone().unwrap_or_default();
+        assert!(req_text.contains("\"orderType\":\"GTC\""),
+            "expected GTC orderType in request, got: {}",
+            truncate(&req_text, 600));
+    }
+
+    #[tokio::test]
+    async fn cancel_order_dry_run_returns_true_without_http() {
+        let cfg = ClobConfig::new(TEST_ADDR, sample_creds(), true);
+        let client = ClobClient::new(cfg).unwrap();
+        assert!(client.cancel_order("0xORDER").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn cancel_order_returns_true_on_2xx() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let body = r#"{"cancelled":true}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
+                    body.len(), body,
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+        let mut cfg = ClobConfig::new(TEST_ADDR, sample_creds(), false);
+        cfg.base_url = format!("http://{}", addr);
+        let client = ClobClient::new(cfg).unwrap();
+        assert!(client.cancel_order("0xORDER").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn cancel_order_returns_false_on_4xx() {
+        // Cancel of an already-filled order returns 4xx.
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let body = r#"{"error":"order not found"}"#;
+                let resp = format!(
+                    "HTTP/1.1 404 NOT FOUND\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
+                    body.len(), body,
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+        let mut cfg = ClobConfig::new(TEST_ADDR, sample_creds(), false);
+        cfg.base_url = format!("http://{}", addr);
+        let client = ClobClient::new(cfg).unwrap();
+        let r = client.cancel_order("0xORDER").await.unwrap();
+        assert!(!r);
+    }
+
+    #[tokio::test]
+    async fn cancel_order_rejects_empty_id() {
+        let cfg = ClobConfig::new(TEST_ADDR, sample_creds(), false);
+        let client = ClobClient::new(cfg).unwrap();
+        assert!(client.cancel_order("").await.is_err());
     }
 }
