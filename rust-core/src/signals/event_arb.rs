@@ -326,6 +326,71 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+// ── Background scanner task ────────────────────────────────────────────────
+
+const GAMMA_EVENTS_URL:    &str = "https://gamma-api.polymarket.com/events";
+const SCANNER_PAGE_LIMIT:  usize = 200;
+const SCANNER_PAGES:       usize = 5;       // 1000 events sampled per pass
+
+/// Long-running task: every `interval_secs`, hit Gamma, run scan_events,
+/// populate the cache.
+///
+/// Robust to network blips: on RPC error we leave the cache as-is and
+/// retry next tick. Don't crash the bot on a Gamma 5xx.
+pub async fn event_arb_scanner_loop(
+    cache:        std::sync::Arc<EventArbCache>,
+    interval_secs: u64,
+) {
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .expect("reqwest client");
+
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval_secs.max(60)));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    tracing::info!(interval_secs, "event arb scanner started");
+
+    loop {
+        tick.tick().await;
+        match scan_once(&http).await {
+            Ok(edges) => {
+                let n = edges.len();
+                cache.set(edges, now_ms());
+                tracing::info!(n_edges = n, "event arb cache populated");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "event arb scan failed — keeping previous cache");
+            }
+        }
+    }
+}
+
+/// One scan pass: fetch up to SCANNER_PAGES × SCANNER_PAGE_LIMIT events,
+/// parse, run scan_events.
+async fn scan_once(http: &reqwest::Client) -> anyhow::Result<Vec<ArbEdge>> {
+    let mut all_events: Vec<GammaEvent> = Vec::new();
+    for page in 0..SCANNER_PAGES {
+        let offset = page * SCANNER_PAGE_LIMIT;
+        let url = format!(
+            "{}?closed=false&active=true&limit={}&offset={}&order=volume&ascending=false",
+            GAMMA_EVENTS_URL, SCANNER_PAGE_LIMIT, offset,
+        );
+        let resp = http.get(&url).send().await
+            .map_err(|e| anyhow::anyhow!("gamma fetch failed: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(anyhow::anyhow!("gamma HTTP {}", resp.status()));
+        }
+        let page_events: Vec<GammaEvent> = resp.json().await
+            .map_err(|e| anyhow::anyhow!("gamma JSON parse: {e}"))?;
+        if page_events.is_empty() { break; }
+        all_events.extend(page_events);
+        // Polite pacing
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+    Ok(scan_events(&all_events))
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

@@ -1,0 +1,28 @@
+[Unit]
+# Constantine — NBA projections sidecar (Linux systemd).
+# See polymarket-bot.service for install / journalctl instructions.
+
+Description=Constantine NBA projections sidecar
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=YOUR_USERNAME_HERE
+WorkingDirectory=/home/YOUR_USERNAME_HERE/Constantine
+ExecStart=/home/YOUR_USERNAME_HERE/Constantine/.venv/bin/python scripts/nba_projections.py --watch
+Restart=on-failure
+RestartSec=10
+
+# Light resource cap — Python sidecar is small
+MemoryMax=512M
+CPUQuota=50%
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/home/YOUR_USERNAME_HERE/Constantine/data
+
+[Install]
+WantedBy=multi-user.target

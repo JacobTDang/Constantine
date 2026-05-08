@@ -219,6 +219,15 @@ async fn main() -> anyhow::Result<()> {
                 let projections_cache = Arc::new(
                     signals::player_props::ProjectionsCache::new()
                 );
+                // Strategy 2: event-arb scanner cache populated by a
+                // sibling task that hits Gamma every 5 min.
+                let event_arb_cache = Arc::new(
+                    signals::event_arb::EventArbCache::new()
+                );
+                tasks.spawn(signals::event_arb::event_arb_scanner_loop(
+                    event_arb_cache.clone(),
+                    300,
+                ));
                 let mut runner_cfg = execution::runner::RunnerConfig::default();
                 runner_cfg.projections_cache = Some(projections_cache.clone());
                 runner_cfg.projections_path  = Some(
@@ -227,6 +236,7 @@ async fn main() -> anyhow::Result<()> {
                     )
                 );
                 runner_cfg.projections_reload_secs = 30;
+                runner_cfg.event_arb_cache = Some(event_arb_cache.clone());
                 // G5: SigningParams replaces the pool. Built once, cloned
                 // per-task by the runner. Kelly bet is honored exactly.
                 let signing = Arc::new(execution::executor::SigningParams {
@@ -242,31 +252,40 @@ async fn main() -> anyhow::Result<()> {
                 // spawning the runner. Catches positions that filled or
                 // failed while the bot was down. Best-effort: any failure
                 // is logged but doesn't block boot.
-                {
-                    let address_for_reconcile = signing.funder_address.clone()
-                        .unwrap_or_else(|| {
-                            execution::orders::private_key_to_address(&c.polymarket_private_key)
-                                .map(|a| execution::orders::address_to_hex(&a))
-                                .unwrap_or_default()
-                        });
-                    if !address_for_reconcile.is_empty() {
-                        match positions
-                            .reconcile_with_polymarket(&client, &address_for_reconcile)
-                            .await
-                        {
-                            Ok(r) => tracing::info!(
-                                checked = r.checked,
-                                filled_late = r.filled_late,
-                                failed_late = r.failed_late,
-                                discrepancies = r.discrepancies,
-                                rpc_errors = r.rpc_errors,
-                                "G13: startup reconciliation complete"
-                            ),
-                            Err(e) => tracing::warn!(error = %e,
-                                "G13: reconciliation failed — continuing with local state"),
-                        }
+                let address_for_reconcile = signing.funder_address.clone()
+                    .unwrap_or_else(|| {
+                        execution::orders::private_key_to_address(&c.polymarket_private_key)
+                            .map(|a| execution::orders::address_to_hex(&a))
+                            .unwrap_or_default()
+                    });
+                if !address_for_reconcile.is_empty() {
+                    match positions
+                        .reconcile_with_polymarket(&client, &address_for_reconcile)
+                        .await
+                    {
+                        Ok(r) => tracing::info!(
+                            checked = r.checked,
+                            filled_late = r.filled_late,
+                            failed_late = r.failed_late,
+                            discrepancies = r.discrepancies,
+                            rpc_errors = r.rpc_errors,
+                            "G13: startup reconciliation complete"
+                        ),
+                        Err(e) => tracing::warn!(error = %e,
+                            "G13: reconciliation failed — continuing with local state"),
                     }
                 }
+
+                // AUTO.A + AUTO.B: maintenance tasks for autonomous running.
+                let maint_cfg = execution::maintenance::MaintenanceConfig::for_owner(
+                    address_for_reconcile.clone(),
+                );
+                tasks.spawn(execution::maintenance::order_ttl_loop(
+                    client.clone(), positions.clone(), maint_cfg.clone(),
+                ));
+                tasks.spawn(execution::maintenance::periodic_reconcile_loop(
+                    client.clone(), positions.clone(), maint_cfg,
+                ));
 
                 tasks.spawn(execution::runner::execution_runner_loop(
                     state.clone(),

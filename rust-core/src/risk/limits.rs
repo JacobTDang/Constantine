@@ -74,6 +74,23 @@ pub enum RiskError {
 
 // ── F2: RiskLimits struct ────────────────────────────────────────────────────
 
+/// AUTO.C: Strategies the runner can independently halt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Strategy {
+    Oracle,         // BTC oracle/intramarket arb (the original strategy)
+    PlayerProps,    // Strategy 1: NBA player props
+    EventArb,       // Strategy 2: event sum-of-YES arb
+}
+
+/// Per-strategy gates so a bug in one strategy doesn't halt the others.
+/// Each one is independent — manual reset only.
+#[derive(Debug, Default)]
+pub struct StrategyKills {
+    pub oracle:       AtomicBool,
+    pub player_props: AtomicBool,
+    pub event_arb:    AtomicBool,
+}
+
 #[derive(Debug)]
 pub struct RiskLimits {
     /// Accumulated losses today (cents, always >= 0)
@@ -86,6 +103,9 @@ pub struct RiskLimits {
     daily_trade_count:    AtomicU32,
     /// Sticky once tripped — only manual reset clears
     kill_switch:          AtomicBool,
+    /// AUTO.C: per-strategy kill switches. A bug in one strategy can be
+    /// contained without halting the others.
+    strategy:             StrategyKills,
     /// G11: transient halt for stale-data scenarios. Auto-clears when the
     /// watchdog sees streams recover. Distinct from kill_switch (which
     /// represents a real failure that needs human review).
@@ -115,6 +135,7 @@ impl RiskLimits {
             open_exposure_cents:  AtomicI64::new(0),
             daily_trade_count:    AtomicU32::new(0),
             kill_switch:          AtomicBool::new(false),
+            strategy:             StrategyKills::default(),
             data_stale:           AtomicBool::new(false),
             realised_pnl_cents:   AtomicI64::new(0),
             last_daily_reset_ms:  AtomicU64::new(0),
@@ -301,6 +322,34 @@ impl RiskLimits {
         self.data_stale.load(Ordering::SeqCst)
     }
 
+    // ── AUTO.C: per-strategy kill switches ──────────────────────────────
+
+    /// Trip a single strategy's kill switch. Other strategies keep
+    /// trading. Manual reset only.
+    pub fn kill_strategy(&self, strategy: Strategy) {
+        match strategy {
+            Strategy::Oracle       => self.strategy.oracle.store(true, Ordering::SeqCst),
+            Strategy::PlayerProps  => self.strategy.player_props.store(true, Ordering::SeqCst),
+            Strategy::EventArb     => self.strategy.event_arb.store(true, Ordering::SeqCst),
+        }
+    }
+
+    pub fn reset_strategy(&self, strategy: Strategy) {
+        match strategy {
+            Strategy::Oracle       => self.strategy.oracle.store(false, Ordering::SeqCst),
+            Strategy::PlayerProps  => self.strategy.player_props.store(false, Ordering::SeqCst),
+            Strategy::EventArb     => self.strategy.event_arb.store(false, Ordering::SeqCst),
+        }
+    }
+
+    pub fn is_strategy_killed(&self, strategy: Strategy) -> bool {
+        match strategy {
+            Strategy::Oracle       => self.strategy.oracle.load(Ordering::SeqCst),
+            Strategy::PlayerProps  => self.strategy.player_props.load(Ordering::SeqCst),
+            Strategy::EventArb     => self.strategy.event_arb.load(Ordering::SeqCst),
+        }
+    }
+
     // ── Resets (lazy, called from can_trade) ──────────────────────────────
 
     fn maybe_reset(&self, now_ms: u64) {
@@ -427,6 +476,43 @@ mod tests {
         r.set_data_stale(true);
         let err = r.can_trade_at(20.0, 1_700_000_000_000, &cfg()).unwrap_err();
         assert_eq!(err, RiskError::DataStale);
+    }
+
+    // ── AUTO.C: per-strategy kill switches ──────────────────────────────
+
+    #[test]
+    fn strategy_kills_are_independent() {
+        let r = RiskLimits::new();
+        // None tripped initially
+        assert!(!r.is_strategy_killed(Strategy::Oracle));
+        assert!(!r.is_strategy_killed(Strategy::PlayerProps));
+        assert!(!r.is_strategy_killed(Strategy::EventArb));
+
+        // Trip Oracle → others unaffected
+        r.kill_strategy(Strategy::Oracle);
+        assert!(r.is_strategy_killed(Strategy::Oracle));
+        assert!(!r.is_strategy_killed(Strategy::PlayerProps));
+        assert!(!r.is_strategy_killed(Strategy::EventArb));
+
+        // Reset Oracle, trip PlayerProps
+        r.reset_strategy(Strategy::Oracle);
+        r.kill_strategy(Strategy::PlayerProps);
+        assert!(!r.is_strategy_killed(Strategy::Oracle));
+        assert!(r.is_strategy_killed(Strategy::PlayerProps));
+        assert!(!r.is_strategy_killed(Strategy::EventArb));
+    }
+
+    #[test]
+    fn strategy_kills_are_distinct_from_global_kill_switch() {
+        let r = RiskLimits::new();
+        r.kill_strategy(Strategy::Oracle);
+        // Global kill switch untouched
+        assert!(!r.is_kill_switch_active());
+        // And vice versa
+        r.activate_kill_switch();
+        assert!(r.is_kill_switch_active());
+        r.reset_kill_switch();
+        assert!(r.is_strategy_killed(Strategy::Oracle));   // strategy still tripped
     }
 
     #[test]
