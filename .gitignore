@@ -45,6 +45,12 @@ Thumbs.db
 *.pem
 *.key
 
-# Internal planning docs — not for public repo
+# Internal planning / research docs — not for public repo
 PHASES.md
 PRODUCTION_PLAN.md
+AUTONOMOUS.md
+EDGES.md
+GAPS.md
+READINESS.md
+REVIEW.md
+STRATEGIES.md
