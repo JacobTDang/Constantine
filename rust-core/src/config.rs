@@ -49,6 +49,20 @@ pub struct Config {
     pub lp_inventory_cap_usd: f64,
     pub lp_refresh_secs:   u64,
 
+    // EDGE-C: Pinnacle devig sportsbook overlay
+    pub sportsbook_devig_enabled: bool,
+    pub sportsbook_devig_path:    String,
+    pub sportsbook_devig_reload_secs: u64,
+
+    // EDGE-D: whale-follow
+    pub whale_follow_enabled: bool,
+    pub whale_trades_path:    String,
+    pub whale_reload_secs:    u64,
+
+    // EDGE-E: hibernating market scanner (observe-only)
+    pub hibernating_enabled:  bool,
+    pub hibernating_scan_secs: u64,
+
     // Logging
     pub log_level: String,
 }
@@ -134,6 +148,16 @@ impl Config {
             lp_max_markets:           u64_var("LP_MAX_MARKETS", 5)? as usize,
             lp_inventory_cap_usd:     f64_var("LP_INVENTORY_CAP_USD", 400.0)?,
             lp_refresh_secs:          u64_var("LP_REFRESH_SECS", 5)?,
+            sportsbook_devig_enabled: bool_var("SPORTSBOOK_DEVIG_ENABLED", false)?,
+            sportsbook_devig_path:    get("SPORTSBOOK_DEVIG_PATH")
+                .unwrap_or_else(|| "data/sportsbook_devig.json".to_string()),
+            sportsbook_devig_reload_secs: u64_var("SPORTSBOOK_DEVIG_RELOAD_SECS", 30)?,
+            whale_follow_enabled:     bool_var("WHALE_FOLLOW_ENABLED", false)?,
+            whale_trades_path:        get("WHALE_TRADES_PATH")
+                .unwrap_or_else(|| "data/whale_trades.jsonl".to_string()),
+            whale_reload_secs:        u64_var("WHALE_RELOAD_SECS", 30)?,
+            hibernating_enabled:      bool_var("HIBERNATING_ENABLED", false)?,
+            hibernating_scan_secs:    u64_var("HIBERNATING_SCAN_SECS", 1800)?,
             log_level:                get("LOG_LEVEL").unwrap_or_else(|| "info".to_string()),
         })
     }

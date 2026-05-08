@@ -77,20 +77,24 @@ pub enum RiskError {
 /// AUTO.C: Strategies the runner can independently halt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Strategy {
-    Oracle,         // BTC oracle/intramarket arb (the original strategy)
-    PlayerProps,    // Strategy 1: NBA player props
-    EventArb,       // Strategy 2: event sum-of-YES arb
-    LpRewards,      // EDGE-A: liquidity rewards market making
+    Oracle,           // BTC oracle/intramarket arb (the original strategy)
+    PlayerProps,      // Strategy 1: NBA player props
+    EventArb,         // Strategy 2: event sum-of-YES arb
+    LpRewards,        // EDGE-A: liquidity rewards market making
+    SportsbookDevig,  // EDGE-C: Pinnacle no-vig overlay
+    WhaleFollow,      // EDGE-D: Polymarket whale-follow
 }
 
 /// Per-strategy gates so a bug in one strategy doesn't halt the others.
 /// Each one is independent — manual reset only.
 #[derive(Debug, Default)]
 pub struct StrategyKills {
-    pub oracle:       AtomicBool,
-    pub player_props: AtomicBool,
-    pub event_arb:    AtomicBool,
-    pub lp_rewards:   AtomicBool,
+    pub oracle:           AtomicBool,
+    pub player_props:     AtomicBool,
+    pub event_arb:        AtomicBool,
+    pub lp_rewards:       AtomicBool,
+    pub sportsbook_devig: AtomicBool,
+    pub whale_follow:     AtomicBool,
 }
 
 #[derive(Debug)]
@@ -330,28 +334,34 @@ impl RiskLimits {
     /// trading. Manual reset only.
     pub fn kill_strategy(&self, strategy: Strategy) {
         match strategy {
-            Strategy::Oracle       => self.strategy.oracle.store(true, Ordering::SeqCst),
-            Strategy::PlayerProps  => self.strategy.player_props.store(true, Ordering::SeqCst),
-            Strategy::EventArb     => self.strategy.event_arb.store(true, Ordering::SeqCst),
-            Strategy::LpRewards    => self.strategy.lp_rewards.store(true, Ordering::SeqCst),
+            Strategy::Oracle          => self.strategy.oracle.store(true, Ordering::SeqCst),
+            Strategy::PlayerProps     => self.strategy.player_props.store(true, Ordering::SeqCst),
+            Strategy::EventArb        => self.strategy.event_arb.store(true, Ordering::SeqCst),
+            Strategy::LpRewards       => self.strategy.lp_rewards.store(true, Ordering::SeqCst),
+            Strategy::SportsbookDevig => self.strategy.sportsbook_devig.store(true, Ordering::SeqCst),
+            Strategy::WhaleFollow     => self.strategy.whale_follow.store(true, Ordering::SeqCst),
         }
     }
 
     pub fn reset_strategy(&self, strategy: Strategy) {
         match strategy {
-            Strategy::Oracle       => self.strategy.oracle.store(false, Ordering::SeqCst),
-            Strategy::PlayerProps  => self.strategy.player_props.store(false, Ordering::SeqCst),
-            Strategy::EventArb     => self.strategy.event_arb.store(false, Ordering::SeqCst),
-            Strategy::LpRewards    => self.strategy.lp_rewards.store(false, Ordering::SeqCst),
+            Strategy::Oracle          => self.strategy.oracle.store(false, Ordering::SeqCst),
+            Strategy::PlayerProps     => self.strategy.player_props.store(false, Ordering::SeqCst),
+            Strategy::EventArb        => self.strategy.event_arb.store(false, Ordering::SeqCst),
+            Strategy::LpRewards       => self.strategy.lp_rewards.store(false, Ordering::SeqCst),
+            Strategy::SportsbookDevig => self.strategy.sportsbook_devig.store(false, Ordering::SeqCst),
+            Strategy::WhaleFollow     => self.strategy.whale_follow.store(false, Ordering::SeqCst),
         }
     }
 
     pub fn is_strategy_killed(&self, strategy: Strategy) -> bool {
         match strategy {
-            Strategy::Oracle       => self.strategy.oracle.load(Ordering::SeqCst),
-            Strategy::PlayerProps  => self.strategy.player_props.load(Ordering::SeqCst),
-            Strategy::EventArb     => self.strategy.event_arb.load(Ordering::SeqCst),
-            Strategy::LpRewards    => self.strategy.lp_rewards.load(Ordering::SeqCst),
+            Strategy::Oracle          => self.strategy.oracle.load(Ordering::SeqCst),
+            Strategy::PlayerProps     => self.strategy.player_props.load(Ordering::SeqCst),
+            Strategy::EventArb        => self.strategy.event_arb.load(Ordering::SeqCst),
+            Strategy::LpRewards       => self.strategy.lp_rewards.load(Ordering::SeqCst),
+            Strategy::SportsbookDevig => self.strategy.sportsbook_devig.load(Ordering::SeqCst),
+            Strategy::WhaleFollow     => self.strategy.whale_follow.load(Ordering::SeqCst),
         }
     }
 

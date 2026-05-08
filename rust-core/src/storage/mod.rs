@@ -37,6 +37,12 @@ pub struct SignalRow {
     pub fired_at_ms:            u64,
     pub market_id:              String,
     pub signal_type:            String,           // "intramarket" | "oracle"
+    /// Strategy that emitted this signal. One of: "oracle", "intramarket",
+    /// "player_props", "event_arb", "sportsbook_devig", "whale_follow",
+    /// "lp_rewards", "hibernating". Used by daily_review.py + ad-hoc
+    /// analysis to slice realized PnL per strategy.
+    #[serde(default)]
+    pub strategy_tag:           String,
     pub direction:              Option<String>,   // "up" | "down" | None
     pub spot_price:             f64,
     pub chainlink_price:        f64,
@@ -56,6 +62,49 @@ pub struct SignalRow {
     pub would_have_bet_dollars: f64,
 }
 
+impl SignalRow {
+    /// Convenience builder for multi-strategy callers that don't have
+    /// the BTC-specific FeatureState columns (chainlink, vol_5m, etc).
+    /// Populates only the fields that matter to the strategy and zeros
+    /// the rest. The `strategy_tag` is required.
+    pub fn for_strategy(
+        strategy_tag: impl Into<String>,
+        market_id:    impl Into<String>,
+        signal_type:  impl Into<String>,
+        direction:    Option<&'static str>,
+        fair_value:   f64,
+        market_price: f64,
+        edge:         f64,
+        confidence:   f64,
+        would_bet:    f64,
+        time_to_close_secs: f64,
+    ) -> Self {
+        Self {
+            fired_at_ms:            chrono::Utc::now().timestamp_millis() as u64,
+            market_id:              market_id.into(),
+            signal_type:            signal_type.into(),
+            strategy_tag:           strategy_tag.into(),
+            direction:              direction.map(|s| s.to_string()),
+            spot_price:             0.0,
+            chainlink_price:        0.0,
+            strike_price:           0.0,
+            yes_ask:                if direction == Some("up")   { market_price } else { 0.0 },
+            no_ask:                 if direction == Some("down") { market_price } else { 0.0 },
+            vol_5m:                 0.0,
+            time_to_close_secs,
+            window_age_secs:        0.0,
+            yes_liquidity_usd:      0.0,
+            no_liquidity_usd:       0.0,
+            spread:                 0.0,
+            regime:                 String::new(),
+            fair_value,
+            edge,
+            confidence,
+            would_have_bet_dollars: would_bet,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SettlementRow {
     pub market_id:            String,
@@ -68,6 +117,7 @@ pub struct SettlementRow {
 
 // ── Append-only JSONL log ────────────────────────────────────────────────────
 
+#[derive(Debug)]
 pub struct SignalLog {
     signals_path:     PathBuf,
     settlements_path: PathBuf,
@@ -134,6 +184,7 @@ mod tests {
             fired_at_ms:            1_700_000_000_000,
             market_id:              market_id.to_string(),
             signal_type:            "oracle".to_string(),
+            strategy_tag:           "oracle".to_string(),
             direction:              Some(dir.to_string()),
             spot_price:             80_000.0,
             chainlink_price:        80_010.0,

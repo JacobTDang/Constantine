@@ -259,6 +259,37 @@ async fn main() -> anyhow::Result<()> {
                 );
                 runner_cfg.projections_reload_secs = 30;
                 runner_cfg.event_arb_cache = Some(event_arb_cache.clone());
+
+                // EDGE-C: Sportsbook devig — Python sidecar writes the JSON.
+                if c.sportsbook_devig_enabled {
+                    let cache = Arc::new(signals::sportsbook_devig::DevigCache::new());
+                    runner_cfg.devig_cache       = Some(cache.clone());
+                    runner_cfg.devig_path        = Some(
+                        std::path::PathBuf::from(&c.sportsbook_devig_path)
+                    );
+                    runner_cfg.devig_reload_secs = c.sportsbook_devig_reload_secs;
+                    tracing::info!(
+                        path = %c.sportsbook_devig_path,
+                        reload_secs = c.sportsbook_devig_reload_secs,
+                        "EDGE-C sportsbook devig enabled"
+                    );
+                }
+                // EDGE-D: Whale follow — Python sidecar appends JSONL.
+                if c.whale_follow_enabled {
+                    let cache = Arc::new(signals::whale_follow::WhaleCache::new());
+                    runner_cfg.whale_cache       = Some(cache.clone());
+                    runner_cfg.whale_path        = Some(
+                        std::path::PathBuf::from(&c.whale_trades_path)
+                    );
+                    runner_cfg.whale_reload_secs = c.whale_reload_secs;
+                    tracing::info!(
+                        path = %c.whale_trades_path,
+                        reload_secs = c.whale_reload_secs,
+                        "EDGE-D whale follow enabled"
+                    );
+                }
+                // Multi-strategy signal logging.
+                runner_cfg.signal_log = Some(signal_log.clone());
                 // G5: SigningParams replaces the pool. Built once, cloned
                 // per-task by the runner. Kelly bet is honored exactly.
                 let signing = Arc::new(execution::executor::SigningParams {
@@ -380,6 +411,55 @@ async fn main() -> anyhow::Result<()> {
         signals::SignalConfig::default(),
         signal_log.clone(),
     ));
+
+    // EDGE-E: Hibernating market scanner — observe-only (no SignalDecision
+    // emitted; logs candidates for offline analysis). Independent of
+    // execution_enabled because it only reads public Gamma data.
+    if let Ok(cfg) = &cfg_result {
+        if cfg.hibernating_enabled {
+            let hib_cache = Arc::new(signals::hibernating::HibernatingCache::new());
+            let scan_secs = cfg.hibernating_scan_secs.max(60);
+            tasks.spawn(signals::hibernating::hibernating_scanner_loop(
+                hib_cache.clone(),
+                std::time::Duration::from_secs(scan_secs),
+            ));
+            // Periodic logger: dump candidates to signals.jsonl for
+            // post-hoc analysis. Same cadence as scan.
+            let log = signal_log.clone();
+            tokio::spawn(async move {
+                let mut t = tokio::time::interval(
+                    std::time::Duration::from_secs(scan_secs)
+                );
+                t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    t.tick().await;
+                    let candidates = hib_cache.snapshot().await;
+                    for c in candidates {
+                        let dir = match c.side_to_take {
+                            signals::hibernating::SideToTake::Yes => Some("up"),
+                            signals::hibernating::SideToTake::No  => Some("down"),
+                        };
+                        let market_price = if dir == Some("up") { c.yes_ask }
+                                           else { (1.0 - c.yes_bid).clamp(0.01, 0.99) };
+                        let row = storage::SignalRow::for_strategy(
+                            "hibernating", &c.condition_id, "oracle", dir,
+                            // fair = "near certain" anchor: 0.97 for YES side,
+                            // 0.03 for NO side (we don't have a true model)
+                            if dir == Some("up") { 0.97 } else { 0.97 },
+                            market_price,
+                            (0.97 - market_price).max(0.0),
+                            0.5,
+                            0.0,        // observe-only: no bet sized
+                            (c.end_date_ms.max(0) as f64
+                                - chrono::Utc::now().timestamp_millis() as f64) / 1000.0,
+                        );
+                        let _ = log.insert_signal(&row);
+                    }
+                }
+            });
+            tracing::info!(scan_secs, "EDGE-E hibernating scanner spawned");
+        }
+    }
 
     // Settlement monitor — when markets resolve, append a SettlementRow and
     // reconcile every open Position for that market with realised P&L

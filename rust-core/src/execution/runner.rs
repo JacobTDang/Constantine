@@ -63,6 +63,17 @@ pub struct RunnerConfig {
     pub event_arb_cache:          Option<Arc<EventArbCache>>,
     pub event_arb_cooldown_secs:  u64,
     pub event_arb_cfg:            EventArbConfig,
+    /// EDGE-C — Sportsbook devig overlay. Reloaded periodically.
+    pub devig_cache:              Option<Arc<crate::signals::sportsbook_devig::DevigCache>>,
+    pub devig_path:               Option<PathBuf>,
+    pub devig_reload_secs:        u64,
+    /// EDGE-D — Whale follow. Reloaded periodically (tail-only read).
+    pub whale_cache:              Option<Arc<crate::signals::whale_follow::WhaleCache>>,
+    pub whale_path:               Option<PathBuf>,
+    pub whale_reload_secs:        u64,
+    /// SignalLog — multi-strategy signal events get logged here with
+    /// strategy_tag so daily_review.py can slice by strategy.
+    pub signal_log:               Option<Arc<crate::storage::SignalLog>>,
 }
 
 impl Default for RunnerConfig {
@@ -79,6 +90,13 @@ impl Default for RunnerConfig {
                 event_budget_usd: 60.0,
                 min_leg_dollars:  5.0,
             },
+            devig_cache:              None,
+            devig_path:               None,
+            devig_reload_secs:        30,
+            whale_cache:              None,
+            whale_path:               None,
+            whale_reload_secs:        30,
+            signal_log:               None,
         }
     }
 }
@@ -130,6 +148,44 @@ pub async fn execution_runner_loop(
         });
     }
 
+    // EDGE-C — Sportsbook devig periodic reload (sibling task).
+    if let (Some(cache), Some(path)) =
+        (runner_cfg.devig_cache.clone(), runner_cfg.devig_path.clone())
+    {
+        let secs = runner_cfg.devig_reload_secs.max(5);
+        tokio::spawn(async move {
+            let mut t = tokio::time::interval(Duration::from_secs(secs));
+            t.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            loop {
+                t.tick().await;
+                match cache.reload(&path) {
+                    Ok(n) => tracing::trace!(n_markets = n, "devig cache reload"),
+                    Err(e) => tracing::warn!(error = %e, "devig reload failed"),
+                }
+            }
+        });
+    }
+
+    // EDGE-D — Whale-trades tail-reader (sibling task).
+    if let (Some(cache), Some(path)) =
+        (runner_cfg.whale_cache.clone(), runner_cfg.whale_path.clone())
+    {
+        let secs = runner_cfg.whale_reload_secs.max(5);
+        tokio::spawn(async move {
+            let mut t = tokio::time::interval(Duration::from_secs(secs));
+            t.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            loop {
+                t.tick().await;
+                match cache.refresh(&path) {
+                    Ok(n) => if n > 0 {
+                        tracing::info!(n_new = n, "whale trades reloaded")
+                    },
+                    Err(e) => tracing::warn!(error = %e, "whale refresh failed"),
+                }
+            }
+        });
+    }
+
     loop {
         tick.tick().await;
 
@@ -147,6 +203,10 @@ pub async fn execution_runner_loop(
         if let Some(cache) = runner_cfg.projections_cache.as_ref() {
             markets_snapshot.extend(cache.synthesize_polymarkets());
         }
+        // EDGE-C: same trick for sportsbook devig markets.
+        if let Some(cache) = runner_cfg.devig_cache.as_ref() {
+            markets_snapshot.extend(cache.synthesize_polymarkets());
+        }
 
         // Evaluate all active markets in parallel via rayon (oracle + intramarket).
         let mut decisions = evaluate_all_markets(
@@ -154,8 +214,44 @@ pub async fn execution_runner_loop(
         );
 
         // Strategy 1: append prop signals from the projections cache.
+        let mut signal_tags: Vec<(String, &'static str)> = Vec::new();
         if let Some(cache) = runner_cfg.projections_cache.as_ref() {
-            decisions.extend(evaluate_all_props(cache));
+            let props = evaluate_all_props(cache);
+            for (mid, _) in &props { signal_tags.push((mid.clone(), "player_props")); }
+            decisions.extend(props);
+        }
+        // EDGE-C: append sportsbook devig signals.
+        if let Some(cache) = runner_cfg.devig_cache.as_ref() {
+            if !risk.is_strategy_killed(crate::risk::limits::Strategy::SportsbookDevig) {
+                let dev = crate::signals::sportsbook_devig::evaluate_all_devig(cache);
+                for (mid, _) in &dev { signal_tags.push((mid.clone(), "sportsbook_devig")); }
+                decisions.extend(dev);
+            }
+        }
+        // EDGE-D: drain whale-cache and append. Drain semantics — each
+        // whale trade fires at most once.
+        if let Some(cache) = runner_cfg.whale_cache.as_ref() {
+            if !risk.is_strategy_killed(crate::risk::limits::Strategy::WhaleFollow) {
+                let whales = crate::signals::whale_follow::evaluate_all_whales(cache);
+                for (mid, _) in &whales { signal_tags.push((mid.clone(), "whale_follow")); }
+                decisions.extend(whales);
+            }
+        }
+
+        // Multi-strategy signal logging — write each fired signal to
+        // signals.jsonl with its strategy_tag so daily_review.py can
+        // slice by strategy.
+        if let Some(log) = runner_cfg.signal_log.as_ref() {
+            for (mid, dec) in &decisions {
+                if matches!(dec, SignalDecision::None) { continue; }
+                let tag = signal_tags.iter()
+                    .find(|(m, _)| m == mid)
+                    .map(|(_, t)| *t)
+                    .unwrap_or("oracle");   // fall through for BTC oracle/intra
+                if let Err(e) = log_signal_with_tag(log, mid, tag, dec) {
+                    tracing::debug!(error = %e, "multi-strategy signal log failed");
+                }
+            }
         }
 
         // Strategy 2: dispatch any event-arb portfolios in cache. Each
@@ -253,6 +349,41 @@ pub async fn execution_runner_loop(
         // Garbage-collect cooldown entries for markets no longer in discovery list.
         last_submit.retain(|id, _| markets_snapshot.iter().any(|m| &m.id == id));
     }
+}
+
+/// Multi-strategy signal log helper. Translates a SignalDecision +
+/// strategy_tag into a SignalRow and appends it to signals.jsonl.
+/// Used by execution_runner_loop to capture every emitted multi-strategy
+/// signal for offline analysis.
+fn log_signal_with_tag(
+    log:          &Arc<crate::storage::SignalLog>,
+    market_id:    &str,
+    strategy_tag: &str,
+    decision:     &SignalDecision,
+) -> anyhow::Result<()> {
+    use crate::signals::Direction;
+    let row = match decision {
+        SignalDecision::None => return Ok(()),
+        SignalDecision::Intramarket(s) => crate::storage::SignalRow::for_strategy(
+            strategy_tag, market_id, "intramarket", None,
+            1.0, 0.5, s.net_profit, 1.0, 30.0, 0.0,
+        ),
+        SignalDecision::Oracle(s) => {
+            let dir_s = match s.direction {
+                Direction::Up   => "up",
+                Direction::Down => "down",
+            };
+            let bet = crate::execution::kelly::kelly_size(
+                s.fair_value, s.market_price, 1500.0, 0.25, 30.0,
+            );
+            crate::storage::SignalRow::for_strategy(
+                strategy_tag, market_id, "oracle", Some(dir_s),
+                s.fair_value, s.market_price, s.edge, s.confidence, bet,
+                s.time_to_close_secs,
+            )
+        }
+    };
+    log.insert_signal(&row)
 }
 
 fn summarize_outcome(o: &crate::execution::executor::ExecOutcome) -> &'static str {

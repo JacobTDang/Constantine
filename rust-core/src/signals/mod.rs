@@ -1,8 +1,11 @@
 pub mod event_arb;
+pub mod hibernating;
 pub mod intramarket;
 pub mod oracle_arb;
 pub mod player_props;
 pub mod regime;
+pub mod sportsbook_devig;
+pub mod whale_follow;
 
 use std::sync::Arc;
 
@@ -358,6 +361,7 @@ fn persist_signal(
     log_db.insert_signal(&SignalRow {
         fired_at_ms:            now_ms,
         market_id,
+        strategy_tag:           signal_type.clone(),    // "intramarket"|"oracle" — primary BTC path
         signal_type,
         direction,
         spot_price:             state.spot_price,

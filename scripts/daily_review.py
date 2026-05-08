@@ -67,12 +67,35 @@ def load_jsonl_window(path: Path, since_ms: int) -> list[dict]:
 def summarize_signals(rows: list[dict]) -> dict:
     if not rows:
         return {"n_total": 0}
-    by_type = Counter(r.get("signal_type", "?") for r in rows)
-    by_market = Counter(r.get("market_id", "?") for r in rows)
+    by_type     = Counter(r.get("signal_type", "?") for r in rows)
+    by_strategy = Counter(r.get("strategy_tag", r.get("signal_type", "?")) for r in rows)
+    by_market   = Counter(r.get("market_id", "?") for r in rows)
+
     avg_edge = sum(r.get("edge", 0) for r in rows) / len(rows)
+
+    # Per-strategy breakdown -- avg edge, n signals, top markets
+    by_strategy_detail: dict[str, dict] = {}
+    for tag in by_strategy:
+        sub = [r for r in rows
+               if r.get("strategy_tag", r.get("signal_type")) == tag]
+        if not sub:
+            continue
+        by_strategy_detail[tag] = {
+            "n":             len(sub),
+            "avg_edge":      round(sum(r.get("edge", 0) for r in sub) / len(sub), 4),
+            "avg_confidence": round(
+                sum(r.get("confidence", 0) for r in sub) / len(sub), 4
+            ),
+            "top_markets":   [m for m, _ in
+                              Counter(r.get("market_id", "?") for r in sub)
+                              .most_common(3)],
+        }
+
     return {
         "n_total":        len(rows),
         "by_signal_type": dict(by_type),
+        "by_strategy":    dict(by_strategy),
+        "by_strategy_detail": by_strategy_detail,
         "top_markets":    [m for m, _ in by_market.most_common(5)],
         "avg_edge":       round(avg_edge, 4),
     }
@@ -98,26 +121,38 @@ def summarize_positions(rows: list[dict]) -> dict:
 
 def build_prompt(sig_summary: dict, pos_summary: dict) -> str:
     return f"""You are a quant trading analyst reviewing a Polymarket bot's last 24h.
-The bot trades multiple strategies (oracle/intramarket arb on BTC, NBA player props, event sum-of-YES arb).
+The bot runs up to 8 strategies in parallel (each tagged with strategy_tag):
+  - oracle / intramarket  — BTC binary mispricing
+  - player_props          — NBA O/U projections (Strategy 1)
+  - event_arb             — sum-of-YES exclusive-winner arb (Strategy 2)
+  - lp_rewards            — liquidity-rewards quoter (EDGE-A)
+  - sportsbook_devig      — Pinnacle no-vig overlay (EDGE-C)
+  - whale_follow          — top-PnL wallet copy (EDGE-D)
+  - hibernating           — observe-only stale-market scanner (EDGE-E)
 
-Signals data:
+Signals data (sliced by strategy_tag where available):
 {json.dumps(sig_summary, indent=2)}
 
 Position lifecycle data:
 {json.dumps(pos_summary, indent=2)}
 
-Write a concise daily report (≤ 300 words) covering:
+Write a concise daily report (<=400 words) covering:
 1. Headline result — was the day profitable? By how much?
-2. Per-strategy attribution — which strategies fired most, won most.
-3. Anomalies — anything unusual? Sudden drop in win rate, spike in
-   rejected orders, unexpected market_ids?
-4. Suggested config tweaks — concrete `.env` changes to consider, with
-   reasoning. NEVER suggest changes that would increase risk
-   irresponsibly. Phrasing: "Consider raising X to Y because Z."
+2. Per-strategy attribution — for each strategy that fired, report n_signals,
+   avg_edge, avg_confidence. Note any strategy with > 100 signals OR > 10%
+   avg_edge — both warrant scrutiny. If `hibernating` fired, list 1-3
+   most-anomalous candidates from top_markets.
+3. Anomalies — sudden win-rate drops, spike in rejected orders, unexpected
+   strategy distributions, low-quality (< 1% avg_edge) signals from a
+   strategy that previously had > 5%.
+4. Suggested config tweaks — concrete `.env` changes to consider, e.g.
+   "raise MIN_EDGE for strategy X to Y because the noise floor is Z."
+   NEVER suggest a change that increases risk irresponsibly.
 5. Things to watch tomorrow.
 
-Format as markdown with section headers. Don't pad the report; if
-nothing notable happened, say so explicitly."""
+Format as markdown with section headers. Don't pad the report; if nothing
+notable happened, say so explicitly. If a strategy emitted zero signals,
+note it (one line) but don't speculate."""
 
 
 def main() -> int:
