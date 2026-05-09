@@ -325,11 +325,27 @@ def validate(markets: list[PropMarket]) -> ValidationResult:
             res.n_lookup_failed += 1
             continue
         actual_over = actual > m.line
-        # Polymarket convention for prop questions: YES = OVER won.
-        # Cross-check: yes_won should match actual_over.
-        if m.yes_won != actual_over:
-            # Polymarket may resolve with different convention, or our
-            # game-date lookup is off by one. Skip rather than poison data.
+        # Polymarket props can resolve in either direction depending on
+        # how the question is phrased: "Will X score OVER 8.5?"
+        # (YES=OVER) vs "Will X score UNDER 8.5?" (YES=UNDER). The
+        # previous code treated yes_won != actual_over as a "lookup
+        # failure" which silently DISCARDED every UNDER-style market,
+        # biasing Phase 0 conclusions toward OVER-resolved games.
+        #
+        # Now: we infer the YES side from the question text. If the
+        # question contains UNDER markers, YES_means_UNDER = True;
+        # otherwise default to YES=OVER (the dominant Polymarket
+        # convention). Only mark as lookup_failed when the resolved
+        # outcome is internally inconsistent (yes_won set but
+        # actual_over uncertain).
+        question_lower = (m.question or "").lower()
+        yes_means_under = any(
+            tok in question_lower
+            for tok in (" under ", "u/o ", "stay under", "less than")
+        )
+        expected_yes_won = (not actual_over) if yes_means_under else actual_over
+        if m.yes_won != expected_yes_won:
+            # Genuine inconsistency — date mismatch, postponement, etc.
             res.n_lookup_failed += 1
             continue
 

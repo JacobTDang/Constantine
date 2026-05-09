@@ -376,10 +376,32 @@ pub async fn execute_intramarket(
         },
     };
 
-    // 2. Sizing — split bet equally across legs. Per-leg bet caps at
-    // max_bet/2 so combined exposure equals max_bet (parity with oracle path).
-    let per_leg_bet = (ctx.risk_cfg.max_bet_dollars * 0.5).max(0.01);
-    let total_bet   = per_leg_bet * 2.0;
+    // 2. Sizing — bankroll- and edge-scaled, capped at max_bet.
+    //
+    // Intramarket arb is effectively risk-free (modulo fee/fill risk):
+    // net profit per total-stake dollar = 1 - (yes_ask + no_ask) =
+    // sig.net_profit. Full Kelly on a risk-free bet says "bet 100% of
+    // bankroll" which is dangerous in practice — fills aren't atomic
+    // and one leg can fail leaving us with directional exposure.
+    //
+    // Scale linearly with bankroll × kelly_fraction × edge so larger
+    // arbs deserve larger sizing, but cap at max_bet_dollars to bound
+    // any single arb's directional-leak risk. Floor at 2 cents
+    // ($0.01 per leg) so the "any positive edge → some bet" property
+    // holds. The previous formula was max_bet × 0.5 per leg
+    // unconditionally, ignoring both bankroll and edge.
+    //
+    // Net-profit multiplier of 10 makes the formula dominant only for
+    // edges above ~0.5%; below that we trust max_bet as the cap.
+    let bankroll = ctx.risk.current_bankroll(ctx.risk_cfg.bankroll);
+    let edge_scaled = bankroll
+        * ctx.risk_cfg.kelly_fraction
+        * sig.net_profit.max(0.0)
+        * 10.0;
+    let total_bet = edge_scaled
+        .min(ctx.risk_cfg.max_bet_dollars)
+        .max(0.02);
+    let per_leg_bet = total_bet / 2.0;
 
     // 3. Risk gate on COMBINED exposure
     if let Err(e) = ctx.risk.can_trade(total_bet, ctx.risk_cfg) {

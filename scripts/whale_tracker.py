@@ -183,6 +183,13 @@ def parse_trade(raw: dict, whale: dict) -> WhaleTrade | None:
         return None
     if price <= 0 or size_shares <= 0:
         return None
+    # ASSUMPTION: data-api `size` is in SHARES (each share = $1 at
+    # resolution), matching CLOB's submit_order convention where
+    # `takerAmount` is also shares. Polymarket docs are silent here.
+    # If it turns out `size` is already USD notional, this overstates
+    # by a factor of 1/price (typically 1.5x-2x). Verify against a
+    # known whale's actual trade once real data flows. If wrong, drop
+    # the multiplication: `size_usd = size_shares`.
     size_usd = price * size_shares
     if size_usd < float(whale.get("min_size_usd", 0)):
         return None

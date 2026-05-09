@@ -34,6 +34,8 @@ pub const STALE_AFTER_MS: u64 = 30 * 60 * 1000;
 /// 2% taker fee twice (entry + exit) plus 1-2% slippage = ~6% min edge.
 pub const MIN_EDGE: f64 = 0.07;
 
+fn default_trading_close_ms() -> i64 { 0 }
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProjectionRow {
     pub market_id:    String,
@@ -49,6 +51,12 @@ pub struct ProjectionRow {
     pub yes_ask:      f64,
     pub yes_bid:      f64,
     pub end_date_ms:  i64,
+    /// Tipoff cutoff — signals after this hit a frozen book on
+    /// Polymarket (props lock at game start). Defaults to 0 for
+    /// backward compat with old projections; in that case
+    /// `evaluate_prop` falls back to `end_date_ms - 3h` as a safety.
+    #[serde(default = "default_trading_close_ms")]
+    pub trading_close_ms: i64,
     pub liquidity:    f64,
     pub volume:       f64,
     pub p_over:       f64,
@@ -163,11 +171,23 @@ pub fn evaluate_prop(
     proj:   &ProjectionRow,
     now_ms: u64,
 ) -> SignalDecision {
-    // Window-end guard: don't fire if game has already ended.
-    let end_ms = proj.end_date_ms.max(0) as u64;
-    if now_ms >= end_ms {
+    // Trading cutoff: Polymarket prop markets lock at TIPOFF, not at
+    // resolution time. Past tipoff our orders hit a frozen book and
+    // either don't fill or fill at stale prices. Use trading_close_ms
+    // when set; fall back to end_date_ms - 3h for old log entries
+    // that pre-date the field (NBA games run ~2-3h).
+    let resolution_ms = proj.end_date_ms.max(0) as u64;
+    let cutoff_ms = if proj.trading_close_ms > 0 {
+        proj.trading_close_ms as u64
+    } else {
+        resolution_ms.saturating_sub(3 * 3_600_000)
+    };
+    if now_ms >= cutoff_ms {
         return SignalDecision::None;
     }
+    // Use cutoff for time_to_close so signal sizing reflects actual
+    // tradeable window, not the post-resolution lag.
+    let end_ms = cutoff_ms;
 
     // Need both YES and NO touch prices populated.
     if proj.yes_ask <= 0.0 || proj.yes_ask >= 1.0 {
@@ -259,7 +279,8 @@ mod tests {
             yes_token_id: "y1".into(),
             no_token_id:  "n1".into(),
             yes_ask, yes_bid,
-            end_date_ms:  9_999_999_999_000,
+            end_date_ms:      9_999_999_999_000,
+            trading_close_ms: 9_999_999_999_000 - 3 * 3_600_000,
             liquidity:    5000.0,
             volume:       500.0,
             p_over,
@@ -316,7 +337,10 @@ mod tests {
     #[test]
     fn skips_when_game_already_ended() {
         let mut row = sample_row(0.80, 0.40, 0.39);
-        row.end_date_ms = 1_000_000_000_000;
+        row.end_date_ms      = 1_000_000_000_000;
+        // Tipoff cutoff is end - 3h (or 0 if absent); set both to be
+        // explicit. evaluate_prop uses trading_close_ms first.
+        row.trading_close_ms = 1_000_000_000_000 - 3 * 3_600_000;
         assert_eq!(evaluate_prop(&row, 1_500_000_000_000), SignalDecision::None);
     }
 

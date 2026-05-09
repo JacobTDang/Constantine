@@ -165,7 +165,14 @@ def parse_game(g: dict, sport_key: str) -> GameLine | None:
             home_imp = 1.0 / home_dec
             away_imp = 1.0 / away_dec
             total = home_imp + away_imp
-            if total <= 0.5 or total > 1.20:
+            # Tightened from (0.5, 1.20] to (0.98, 1.10]. Pinnacle's
+            # typical vig is 1.01-1.04; Bet365 / DraftKings 1.04-1.08.
+            # Anything outside this is a stale/stuck line where devig
+            # yields phantom edges. Wider 3-way markets (NHL with draw,
+            # soccer) live elsewhere; this strategy is moneyline-only.
+            if total <= 0.98 or total > 1.10:
+                log.debug("dropped %s vs %s on %s: vig total %.3f",
+                          home, away, book.get("key", "?"), total)
                 continue
             return GameLine(
                 sport_key   = sport_key,
@@ -231,11 +238,28 @@ def match_market(market: dict, lines: list[GameLine]) -> GameLine | None:
 
     best: GameLine | None = None
     for line in lines:
-        # Both team last-words present, end-date within +/- 36h of commence
-        home_last = line.home_team.split()[-1].lower()
-        away_last = line.away_team.split()[-1].lower()
-        if home_last in q_lower and away_last in q_lower:
-            if end_ms == 0 or abs(end_ms - line.commence_ms) <= 36 * 3_600_000:
+        # Match on FULL team names (not just last words) to avoid
+        # collisions like "Heat" matching both Miami Heat and weather
+        # markets, or "Wizards" matching multiple simultaneous games.
+        # Fall through to last-word match only if neither full name
+        # fits — some Polymarket questions abbreviate (e.g. "Lakers"
+        # for "Los Angeles Lakers").
+        home_full = line.home_team.lower()
+        away_full = line.away_team.lower()
+        full_match = home_full in q_lower and away_full in q_lower
+        if not full_match:
+            home_last = line.home_team.split()[-1].lower()
+            away_last = line.away_team.split()[-1].lower()
+            # Require the last word to be reasonably distinct (>= 4
+            # chars) so common short tokens like "FC", "City", "United"
+            # don't trigger false positives on unrelated markets.
+            if len(home_last) < 4 or len(away_last) < 4:
+                continue
+            full_match = home_last in q_lower and away_last in q_lower
+        if full_match:
+            # Also require commence_time within 12h of end_ms (tightened
+            # from 36h) to disambiguate same-team rematches.
+            if end_ms == 0 or abs(end_ms - line.commence_ms) <= 12 * 3_600_000:
                 best = line
                 break
     return best

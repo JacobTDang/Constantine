@@ -82,7 +82,9 @@ class PolyProp:
     no_token_id:  str
     yes_ask:      float
     yes_bid:      float
-    end_date_ms:  int
+    end_date_ms:  int       # market resolution time (hours after game ends)
+    # trading_close_ms: tipoff cutoff — signals after this hit a frozen book
+    trading_close_ms: int   # game start (or end_date - 3h fallback)
     liquidity:    float
     volume:       float
 
@@ -150,6 +152,28 @@ def parse_prop_market(market: dict, event: dict) -> PolyProp | None:
     except (TypeError, AttributeError, ValueError):
         return None
 
+    # Trading cutoff: Polymarket prop markets typically lock at game
+    # tipoff, NOT at the resolution time (which is hours after the
+    # final box score). If we keep emitting signals past tipoff we're
+    # trading against a frozen book — orders won't fill or fill stale.
+    # Prefer event.gameStartTime; fall back to event.startDate; last
+    # resort: end_ms - 3h (NBA games run 2-3h, so this is conservative).
+    trading_close_ms = end_ms
+    for field in ("gameStartTime", "startDate"):
+        raw = event.get(field)
+        if not raw:
+            continue
+        try:
+            ts = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            trading_close_ms = int(ts.timestamp() * 1000)
+            break
+        except (TypeError, ValueError, AttributeError):
+            continue
+    if trading_close_ms == end_ms:
+        # No tipoff time available — back off 3h from resolution as
+        # the safety margin.
+        trading_close_ms = max(end_ms - 3 * 3_600_000, 0)
+
     try:
         yes_ask = float(market.get("bestAsk") or 0)
         yes_bid = float(market.get("bestBid") or 0)
@@ -169,6 +193,7 @@ def parse_prop_market(market: dict, event: dict) -> PolyProp | None:
         yes_ask=      yes_ask,
         yes_bid=      yes_bid,
         end_date_ms=  end_ms,
+        trading_close_ms= trading_close_ms,
         liquidity=    float(market.get("liquidity", 0) or 0),
         volume=       float(market.get("volume",    0) or 0),
     )
@@ -230,13 +255,28 @@ def project(prop: PolyProp, cache: PlayerStatsCache) -> tuple[float, dict]:
     rolling = [float(r[prop.stat_code]) for r in rows[:ROLLING_GAMES] if prop.stat_code in r]
     if len(rolling) < MIN_GAMES:
         return DEFAULT_OUT_PCT, {**diag, "error": "insufficient_stat_data", "n_games": len(rolling)}
+    # Short-season suppression: at season start, sample size is too
+    # small for the sigmoid to give meaningful confidence — variance
+    # estimate is unreliable, sigma falls back to DEFAULT_SIGMA=4.0
+    # which is too tight, producing false-positive OVER signals.
+    # Require a stable sample of at least ROLLING_GAMES (10) to fire
+    # a signal; otherwise return p_over = 0.50 = no edge claimed.
+    if len(rolling) < ROLLING_GAMES:
+        return DEFAULT_OUT_PCT, {**diag, "warn": "short_season",
+                                  "n_games": len(rolling),
+                                  "min_required": ROLLING_GAMES}
     avg = sum(rolling) / len(rolling)
 
-    # Sigma from last 30 games
+    # Sigma from last 30 games. Use SAMPLE variance (n-1) — we're
+    # estimating population variance from a sample, not computing the
+    # exact variance of the sample itself. Population variance (n)
+    # underestimates true sigma slightly, which makes the sigmoid
+    # steeper and inflates p_over confidence on weak signals.
     sigma_sample = [float(r[prop.stat_code]) for r in rows[:SIGMA_GAMES] if prop.stat_code in r]
     if len(sigma_sample) >= MIN_GAMES:
         m = sum(sigma_sample) / len(sigma_sample)
-        var = sum((x - m) ** 2 for x in sigma_sample) / len(sigma_sample)
+        denom = max(len(sigma_sample) - 1, 1)
+        var = sum((x - m) ** 2 for x in sigma_sample) / denom
         sigma = max(math.sqrt(var), 0.5)
     else:
         sigma = DEFAULT_SIGMA
@@ -273,11 +313,18 @@ def build_projections(props: list[PolyProp]) -> dict:
             "no_token_id":  p.no_token_id,
             "yes_ask":      p.yes_ask,
             "yes_bid":      p.yes_bid,
-            "end_date_ms":  p.end_date_ms,
+            "end_date_ms":      p.end_date_ms,
+            "trading_close_ms": p.trading_close_ms,
             "liquidity":    p.liquidity,
             "volume":       p.volume,
             "p_over":       round(p_over, 4),
             "edge_over":    round(p_over  - p.yes_ask, 4) if p.yes_ask > 0 else 0.0,
+            # edge_under is for BUYING NO at no_ask = (1 - yes_bid).
+            # Edge = p_under - no_ask = (1 - p_over) - (1 - yes_bid)
+            #      = yes_bid - p_over.
+            # Match the SAME side semantics as edge_over (which is for
+            # BUYING YES at yes_ask). Rust recomputes its own edge so
+            # this field is informational; keep formula explicit.
             "edge_under":   round((1.0 - p_over) - (1.0 - p.yes_bid), 4) if p.yes_bid > 0 else 0.0,
             "diagnostics":  diag,
         })
