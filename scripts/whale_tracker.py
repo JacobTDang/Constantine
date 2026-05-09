@@ -58,7 +58,8 @@ class WhaleTrade:
     market_id:      str       # condition_id
     asset_id:       str       # token id
     side:           str       # "BUY" / "SELL"
-    outcome:        str       # "yes" / "no" / unknown — best-effort from market metadata
+    outcome:        str       # text label, e.g. "Yes" / "No" / "Lakers"
+    outcome_index:  int       # 0 = first outcome (YES/Up), 1 = second (NO/Down), -1 unknown
     price:          float
     size_shares:    float
     size_usd:       float
@@ -122,6 +123,14 @@ def parse_trade(raw: dict, whale: dict) -> WhaleTrade | None:
     asset_id  = raw.get("asset") or raw.get("asset_id") or raw.get("tokenId") or ""
     side      = (raw.get("side") or "").upper()
     outcome   = (raw.get("outcome") or "").lower()
+    # outcomeIndex is the reliable direction marker (0=YES, 1=NO) and is
+    # always populated by data-api/trades; outcome string varies for
+    # multi-outcome events (e.g. "Lakers" instead of "Yes").
+    raw_idx = raw.get("outcomeIndex")
+    try:
+        outcome_index = int(raw_idx) if raw_idx is not None else -1
+    except (TypeError, ValueError):
+        outcome_index = -1
 
     try:
         price = float(raw.get("price") or 0)
@@ -148,6 +157,7 @@ def parse_trade(raw: dict, whale: dict) -> WhaleTrade | None:
         asset_id       = str(asset_id),
         side           = side or "BUY",
         outcome        = outcome,
+        outcome_index  = outcome_index,
         price          = price,
         size_shares    = size_shares,
         size_usd       = size_usd,
@@ -171,6 +181,7 @@ def append_jsonl(rows: list[WhaleTrade]) -> None:
                 "asset_id":       r.asset_id,
                 "side":           r.side,
                 "outcome":        r.outcome,
+                "outcome_index":  r.outcome_index,
                 "price":          r.price,
                 "size_shares":    r.size_shares,
                 "size_usd":       r.size_usd,

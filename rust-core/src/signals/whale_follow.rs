@@ -46,6 +46,8 @@ pub const FOLLOW_MIN_PRICE_LOWER: f64 = 0.10;
 /// Upper bound. >0.90 means the whale paid near-cap; little upside.
 pub const FOLLOW_MAX_PRICE_UPPER: f64 = 0.90;
 
+fn default_outcome_index() -> i32 { -1 }
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct WhaleTrade {
     pub trade_id:       String,
@@ -54,7 +56,13 @@ pub struct WhaleTrade {
     pub market_id:      String,
     pub asset_id:       String,
     pub side:           String,    // "BUY" / "SELL"
-    pub outcome:        String,    // "yes" / "no" / ""
+    pub outcome:        String,    // text label: "Yes" / "No" / "Lakers" / ...
+    /// 0 = first outcome (YES/Up), 1 = second outcome (NO/Down).
+    /// `-1` if absent (older log entries pre-dating the dual-source fix).
+    /// Always populated by data-api/trades; reliable across binary AND
+    /// multi-outcome events (where `outcome` is a candidate name).
+    #[serde(default = "default_outcome_index")]
+    pub outcome_index:  i32,
     pub price:          f64,
     pub size_shares:    f64,
     pub size_usd:       f64,
@@ -136,13 +144,17 @@ pub fn evaluate_whale_trade(t: &WhaleTrade, now_ms: u64) -> SignalDecision {
     let age_secs = now_ms.saturating_sub(t.ts_ms) / 1_000;
     if age_secs > FOLLOW_MAX_AGE_SECS { return SignalDecision::None; }
 
-    // Direction inference: outcome=="yes" -> Up, outcome=="no" -> Down.
-    // If outcome is missing, skip rather than guess.
-    let direction = match t.outcome.to_lowercase().as_str() {
-        "yes" => Direction::Up,
-        "no"  => Direction::Down,
-        _     => return SignalDecision::None,
-    };
+    // Direction inference: prefer outcome_index (reliable for both
+    // binary and multi-outcome events), fall back to outcome string.
+    let direction = if t.outcome_index == 0 { Direction::Up }
+        else if t.outcome_index == 1 { Direction::Down }
+        else {
+            match t.outcome.to_lowercase().as_str() {
+                "yes" => Direction::Up,
+                "no"  => Direction::Down,
+                _     => return SignalDecision::None,
+            }
+        };
 
     // We're following — our "fair_value" is the whale's price; we'd
     // pay up to that minus a small slippage budget.
@@ -194,6 +206,7 @@ mod tests {
             "trade_id": t.trade_id, "whale_address": t.whale_address,
             "whale_nickname": t.whale_nickname, "market_id": t.market_id,
             "asset_id": t.asset_id, "side": t.side, "outcome": t.outcome,
+            "outcome_index": t.outcome_index,
             "price": t.price, "size_shares": t.size_shares,
             "size_usd": t.size_usd, "ts_ms": t.ts_ms,
         })).unwrap()).unwrap();
@@ -201,6 +214,11 @@ mod tests {
 
     fn sample_trade(side: &str, outcome: &str, price: f64, size_usd: f64,
                     ts_ms: u64) -> WhaleTrade {
+        sample_trade_idx(side, outcome, -1, price, size_usd, ts_ms)
+    }
+
+    fn sample_trade_idx(side: &str, outcome: &str, outcome_index: i32,
+                        price: f64, size_usd: f64, ts_ms: u64) -> WhaleTrade {
         WhaleTrade {
             trade_id:       format!("t-{}", uuid::Uuid::new_v4()),
             whale_address:  "0xabc".into(),
@@ -209,6 +227,7 @@ mod tests {
             asset_id:       "tok-y".into(),
             side:           side.into(),
             outcome:        outcome.into(),
+            outcome_index,
             price,
             size_shares:    size_usd / price.max(0.01),
             size_usd,
@@ -342,5 +361,41 @@ mod tests {
         std::fs::write(&path, "not json\n{}\n").unwrap();
         assert_eq!(cache.refresh(&path).unwrap(), 0);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn evaluate_uses_outcome_index_when_outcome_string_unknown() {
+        // Multi-outcome event: outcome label is a candidate name like
+        // "Lakers", but outcome_index=0 means YES side. We should follow
+        // it as Direction::Up despite the unknown string.
+        let now = chrono::Utc::now().timestamp_millis() as u64;
+        let t = sample_trade_idx("BUY", "Lakers", 0, 0.55, 5_000.0, now);
+        match evaluate_whale_trade(&t, now) {
+            SignalDecision::Oracle(s) => assert_eq!(s.direction, Direction::Up),
+            d => panic!("expected Oracle Up via outcome_index, got {:?}", d),
+        }
+
+        // outcome_index=1 with multi-outcome label → Down
+        let t2 = sample_trade_idx("BUY", "Warriors", 1, 0.45, 5_000.0, now);
+        match evaluate_whale_trade(&t2, now) {
+            SignalDecision::Oracle(s) => assert_eq!(s.direction, Direction::Down),
+            d => panic!("expected Oracle Down via outcome_index, got {:?}", d),
+        }
+    }
+
+    #[test]
+    fn evaluate_falls_back_to_outcome_string_when_index_missing() {
+        // Old log entry style: outcome_index = -1 (the default), but
+        // outcome string is "Yes" — should still fire as Up.
+        let now = chrono::Utc::now().timestamp_millis() as u64;
+        let t = sample_trade_idx("BUY", "Yes", -1, 0.55, 5_000.0, now);
+        match evaluate_whale_trade(&t, now) {
+            SignalDecision::Oracle(s) => assert_eq!(s.direction, Direction::Up),
+            d => panic!("expected Oracle Up via fallback, got {:?}", d),
+        }
+        // outcome_index missing AND outcome unknown → None (preserves
+        // old behavior — no random guessing on opaque rows).
+        let t2 = sample_trade_idx("BUY", "Lakers", -1, 0.55, 5_000.0, now);
+        assert!(matches!(evaluate_whale_trade(&t2, now), SignalDecision::None));
     }
 }

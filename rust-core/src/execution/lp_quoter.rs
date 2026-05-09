@@ -342,8 +342,8 @@ pub async fn refresh_market(
         let inputs = BuyOrderInputs {
             asset_id: asset, maker, signer, taker: signing.taker,
             bet_dollars: cfg.quote_size_usd, price_cents: yes_cents,
-            // Reasonable safety expiry: 1h, longer than refresh cadence
-            expiration_unix: now_ms / 1000 + 3600,
+            // GTC: 0 = no expiration (orders rest until cancelled)
+            expiration_unix: 0,
             nonce: signing.nonce, fee_rate_bps: signing.fee_rate_bps,
             signature_type: signing.signature_type,
         };
@@ -360,7 +360,8 @@ pub async fn refresh_market(
         let inputs = BuyOrderInputs {
             asset_id: asset, maker, signer, taker: signing.taker,
             bet_dollars: cfg.quote_size_usd, price_cents: no_cents,
-            expiration_unix: now_ms / 1000 + 3600,
+            // GTC: 0 = no expiration (orders rest until cancelled)
+            expiration_unix: 0,
             nonce: signing.nonce, fee_rate_bps: signing.fee_rate_bps,
             signature_type: signing.signature_type,
         };

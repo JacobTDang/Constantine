@@ -240,16 +240,19 @@ pub async fn execution_runner_loop(
 
         // Multi-strategy signal logging — write each fired signal to
         // signals.jsonl with its strategy_tag so daily_review.py can
-        // slice by strategy.
+        // slice by strategy. BTC primary signals are logged by
+        // signal_loop (single source of truth) — only multi-strategy
+        // paths (props/devig/whale/lp_rewards) tag here.
         if let Some(log) = runner_cfg.signal_log.as_ref() {
             for (mid, dec) in &decisions {
                 if matches!(dec, SignalDecision::None) { continue; }
-                let tag = signal_tags.iter()
+                if let Some(tag) = signal_tags.iter()
                     .find(|(m, _)| m == mid)
                     .map(|(_, t)| *t)
-                    .unwrap_or("oracle");   // fall through for BTC oracle/intra
-                if let Err(e) = log_signal_with_tag(log, mid, tag, dec) {
-                    tracing::debug!(error = %e, "multi-strategy signal log failed");
+                {
+                    if let Err(e) = log_signal_with_tag(log, mid, tag, dec) {
+                        tracing::debug!(error = %e, "multi-strategy signal log failed");
+                    }
                 }
             }
         }

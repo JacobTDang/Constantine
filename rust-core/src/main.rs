@@ -424,8 +424,12 @@ async fn main() -> anyhow::Result<()> {
                 std::time::Duration::from_secs(scan_secs),
             ));
             // Periodic logger: dump candidates to signals.jsonl for
-            // post-hoc analysis. Same cadence as scan.
+            // post-hoc analysis. Same cadence as scan. Dedup by
+            // (condition_id, side) so a market sitting in cache for
+            // hours doesn't get logged on every tick.
             let log = signal_log.clone();
+            let seen: Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
+                Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
             tokio::spawn(async move {
                 let mut t = tokio::time::interval(
                     std::time::Duration::from_secs(scan_secs)
@@ -439,6 +443,17 @@ async fn main() -> anyhow::Result<()> {
                             signals::hibernating::SideToTake::Yes => Some("up"),
                             signals::hibernating::SideToTake::No  => Some("down"),
                         };
+                        let key = format!("{}|{}",
+                            c.condition_id, c.side_to_take.as_str());
+                        {
+                            let mut g = seen.lock().expect("poisoned");
+                            if g.contains(&key) { continue; }
+                            // 10k entries ~= 14 days at typical scan rates;
+                            // full-clear is fine — re-logging on day 14+ is
+                            // desirable for forward test
+                            if g.len() >= 10_000 { g.clear(); }
+                            g.insert(key);
+                        }
                         let market_price = if dir == Some("up") { c.yes_ask }
                                            else { (1.0 - c.yes_bid).clamp(0.01, 0.99) };
                         let row = storage::SignalRow::for_strategy(
