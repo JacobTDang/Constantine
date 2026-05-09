@@ -71,6 +71,13 @@ pub struct SignalConfig {
     pub max_touch_consumption:      f64,
     /// Caller's max bet — used in the touch-consumption check. Default $30.
     pub max_bet_dollars:            f64,
+
+    /// When `signal_loop` runs alongside `execution_runner_loop`, only
+    /// the runner should write to signals.jsonl (it sees ALL markets,
+    /// not just the primary BTC one). Set this `false` from main.rs
+    /// when execution is enabled. Default `true` keeps observe-only
+    /// mode working — signal_loop is the sole writer there.
+    pub persist_to_db:              bool,
 }
 
 impl Default for SignalConfig {
@@ -86,6 +93,7 @@ impl Default for SignalConfig {
             min_ask_depth_usd:       50.0,
             max_touch_consumption:   0.5,
             max_bet_dollars:         30.0,
+            persist_to_db:           true,
         }
     }
 }
@@ -302,8 +310,10 @@ pub async fn signal_loop(
                     ?regime,
                     "INTRAMARKET ARB"
                 );
-                if let Err(e) = persist_signal(&log_db, &s, regime, &decision) {
-                    tracing::error!(error = %e, "failed to persist signal to sqlite");
+                if cfg.persist_to_db {
+                    if let Err(e) = persist_signal(&log_db, &s, regime, &decision) {
+                        tracing::error!(error = %e, "failed to persist signal to sqlite");
+                    }
                 }
             }
             SignalDecision::Oracle(sig) => {
@@ -318,8 +328,10 @@ pub async fn signal_loop(
                     ?regime,
                     "ORACLE ARB"
                 );
-                if let Err(e) = persist_signal(&log_db, &s, regime, &decision) {
-                    tracing::error!(error = %e, "failed to persist signal to sqlite");
+                if cfg.persist_to_db {
+                    if let Err(e) = persist_signal(&log_db, &s, regime, &decision) {
+                        tracing::error!(error = %e, "failed to persist signal to sqlite");
+                    }
                 }
             }
         }

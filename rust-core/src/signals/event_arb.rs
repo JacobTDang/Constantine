@@ -160,14 +160,24 @@ pub fn compute_arb(snap: &EventSnap) -> Option<ArbEdge> {
         return None;
     }
 
-    // Rank legs by per-leg "edge density" — how much of the captureable
-    // surplus this leg contributes per dollar locked. For an N-leg
-    // portfolio: profit = (N-1) - sum(no_ask). Per-leg contribution to
-    // profit is approximately yes_ask (since no_ask = 1 - yes_bid ≈ 1 - yes_ask
-    // when spreads are tight — long-shots contribute most because they
-    // have low yes_ask, hence low no_ask cost relative to $1 payout).
+    // Rank legs by per-leg "edge density" — profit contribution per
+    // dollar of capital locked.
+    //
+    // For an N-leg portfolio of BUY-NO orders: profit = sum(yes_ask) - 1
+    // (exactly one candidate wins → N-1 NO legs pay out $1 each, total
+    // payout = N-1, total cost = sum(no_ask) = sum(1 - yes_bid) ≈
+    // N - sum(yes_ask), so profit = (N-1) - (N - sum(yes_ask)) =
+    // sum(yes_ask) - 1).
+    //
+    // To maximise profit with capped MAX_LEGS we want the legs with the
+    // highest yes_ask (heavy / favourite legs), NOT the longshots —
+    // longshots contribute ~0.02 each to the sum-of-yes whereas a
+    // favourite at 0.40 contributes 20× more per leg. ROI per dollar
+    // locked = yes_ask / no_ask, also monotonic in yes_ask.
+    //
+    // Sort DESCENDING so we take heavy legs first.
     let mut sorted = legs.clone();
-    sorted.sort_by(|a, b| a.yes_ask.partial_cmp(&b.yes_ask)
+    sorted.sort_by(|a, b| b.yes_ask.partial_cmp(&a.yes_ask)
         .unwrap_or(std::cmp::Ordering::Equal));
 
     let take_n = sorted.len().min(MAX_LEGS_PER_PORTFOLIO);

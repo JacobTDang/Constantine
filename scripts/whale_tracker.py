@@ -26,6 +26,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import collections
 import json
 import logging
 import os
@@ -81,19 +82,62 @@ def load_whales() -> list[dict]:
         return []
 
 
-def load_seen() -> set[str]:
+SEEN_CAP = 50_000
+
+
+class SeenSet:
+    """Insertion-order-preserving cap-bounded id set.
+
+    Backed by a deque (for FIFO eviction) + set (for O(1) membership).
+    Past `SEEN_CAP` entries the oldest are evicted in insertion order —
+    the previous implementation sorted IDs alphabetically and kept the
+    last `SEEN_CAP` of that sort, which silently dropped recent entries
+    since trade_ids are hashes (not time-ordered).
+    """
+    __slots__ = ("_set", "_order")
+
+    def __init__(self) -> None:
+        self._set: set[str] = set()
+        self._order: collections.deque[str] = collections.deque()
+
+    def __contains__(self, key: str) -> bool:
+        return key in self._set
+
+    def __len__(self) -> int:
+        return len(self._set)
+
+    def add(self, key: str) -> None:
+        if key in self._set:
+            return
+        self._set.add(key)
+        self._order.append(key)
+        while len(self._order) > SEEN_CAP:
+            evicted = self._order.popleft()
+            self._set.discard(evicted)
+
+    def to_list(self) -> list[str]:
+        return list(self._order)
+
+
+def load_seen() -> SeenSet:
+    s = SeenSet()
     if not SEEN_PATH.exists():
-        return set()
+        return s
     try:
-        return set(json.loads(SEEN_PATH.read_text()))
+        raw = json.loads(SEEN_PATH.read_text())
+        if isinstance(raw, list):
+            for k in raw:
+                if isinstance(k, str):
+                    s.add(k)
     except (OSError, json.JSONDecodeError):
-        return set()
+        pass
+    return s
 
 
-def save_seen(seen: set[str]) -> None:
+def save_seen(seen: SeenSet) -> None:
     SEEN_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp = SEEN_PATH.with_suffix(".tmp")
-    tmp.write_text(json.dumps(sorted(seen)[-50_000:]))   # cap at 50k IDs
+    tmp.write_text(json.dumps(seen.to_list()))
     tmp.replace(SEEN_PATH)
 
 
@@ -147,6 +191,14 @@ def parse_trade(raw: dict, whale: dict) -> WhaleTrade | None:
     try:
         ts_ms = int(ts) * 1000 if ts and int(ts) < 10**12 else int(ts or 0)
     except (TypeError, ValueError):
+        ts_ms = 0
+    # Fallback when timestamp is missing or unparseable: use now() rather
+    # than 0. The Rust evaluator treats ts_ms=0 as multi-decade-old and
+    # silently drops the signal — we'd rather be loud about a stale
+    # follow than mute about a missing timestamp.
+    if ts_ms <= 0:
+        log.warning("trade %s missing timestamp; using now() (whale=%s)",
+                    trade_id, whale.get("nickname", "?"))
         ts_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
 
     return WhaleTrade(

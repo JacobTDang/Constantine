@@ -238,21 +238,26 @@ pub async fn execution_runner_loop(
             }
         }
 
-        // Multi-strategy signal logging — write each fired signal to
-        // signals.jsonl with its strategy_tag so daily_review.py can
-        // slice by strategy. BTC primary signals are logged by
-        // signal_loop (single source of truth) — only multi-strategy
-        // paths (props/devig/whale/lp_rewards) tag here.
+        // Per-strategy signal logging. The runner is the single source
+        // of truth for signals.jsonl when execution is enabled — we see
+        // ALL markets (oracle/intramarket on every BTC window, plus
+        // props/devig/whale/lp_rewards from the explicit signal_tags
+        // list). signal_loop's persist is disabled in this mode (see
+        // SignalConfig::persist_to_db) to avoid double-logging the
+        // primary BTC market.
         if let Some(log) = runner_cfg.signal_log.as_ref() {
             for (mid, dec) in &decisions {
                 if matches!(dec, SignalDecision::None) { continue; }
-                if let Some(tag) = signal_tags.iter()
+                let tag: &'static str = signal_tags.iter()
                     .find(|(m, _)| m == mid)
                     .map(|(_, t)| *t)
-                {
-                    if let Err(e) = log_signal_with_tag(log, mid, tag, dec) {
-                        tracing::debug!(error = %e, "multi-strategy signal log failed");
-                    }
+                    .unwrap_or_else(|| match dec {
+                        SignalDecision::Intramarket(_) => "intramarket",
+                        SignalDecision::Oracle(_)      => "oracle",
+                        SignalDecision::None           => "unknown",
+                    });
+                if let Err(e) = log_signal_with_tag(log, mid, tag, dec) {
+                    tracing::debug!(error = %e, "signal log failed");
                 }
             }
         }
@@ -268,7 +273,13 @@ pub async fn execution_runner_loop(
                     let dt = now_ms.saturating_sub(*last);
                     if dt < runner_cfg.event_arb_cooldown_secs * 1000 { continue; }
                 }
-                last_submit.insert(key, now_ms);
+                // Tentatively mark cooldown so concurrent ticks don't
+                // double-dispatch this event. If the risk gate rejects
+                // inside the spawned task, we REMOVE the entry below so
+                // the next tick can retry — without this, a single risk
+                // rejection would lock the event out for the full
+                // event_arb_cooldown_secs (default 1h).
+                last_submit.insert(key.clone(), now_ms);
 
                 let cfg     = runner_cfg.event_arb_cfg;
                 let r2      = risk.clone();
@@ -276,10 +287,19 @@ pub async fn execution_runner_loop(
                 let pos     = positions.clone();
                 let sg      = signing.clone();
                 let rcfg    = risk_cfg;
+                let cd_key  = key.clone();
+                let lst     = last_submit.clone();
                 tokio::spawn(async move {
-                    let _ = execute_event_arb(
+                    let outcome = execute_event_arb(
                         &edge, &cfg, &r2, &rcfg, &sg, &cl, Some(&pos),
                     ).await;
+                    // B8: risk-gate rejection produces an empty legs vec.
+                    // Clear cooldown so the next tick can retry — don't
+                    // lock the event for an hour over a transient
+                    // exposure/kill-switch state.
+                    if outcome.legs.is_empty() {
+                        lst.remove(&cd_key);
+                    }
                 });
             }
         }
@@ -288,12 +308,28 @@ pub async fn execution_runner_loop(
         for (market_id, decision) in decisions {
             if matches!(decision, SignalDecision::None) { continue; }
 
-            // Per-market cooldown
-            if let Some(last) = last_submit.get(&market_id) {
+            // B9: cooldown key includes strategy_tag so multi-strategy
+            // signals on the same market_id don't block each other.
+            // Tag resolution: explicit signal_tags mapping (set by
+            // multi-strategy paths) wins; otherwise derive from the
+            // decision variant (BTC oracle/intramarket).
+            let tag: &'static str = signal_tags.iter()
+                .find(|(m, _)| m == &market_id)
+                .map(|(_, t)| *t)
+                .unwrap_or_else(|| match &decision {
+                    SignalDecision::Intramarket(_) => "intramarket",
+                    SignalDecision::Oracle(_)      => "oracle",
+                    SignalDecision::None           => "unknown",
+                });
+            let cd_key = format!("{}::{}", tag, market_id);
+
+            // Per-(strategy, market) cooldown
+            if let Some(last) = last_submit.get(&cd_key) {
                 let dt_ms = now_ms.saturating_sub(*last);
                 if dt_ms < runner_cfg.min_market_cooldown_secs * 1000 {
                     tracing::trace!(
                         market = %market_id,
+                        tag,
                         dt_ms,
                         "skipping — within cooldown"
                     );
@@ -314,7 +350,7 @@ pub async fn execution_runner_loop(
 
             // Mark cooldown BEFORE spawn so simultaneous evaluations
             // (e.g. tick boundary collision) see it.
-            last_submit.insert(market_id.clone(), now_ms);
+            last_submit.insert(cd_key, now_ms);
             in_flight.fetch_add(1, std::sync::atomic::Ordering::Release);
 
             // Spawn — every signal executes in parallel.
@@ -349,8 +385,24 @@ pub async fn execution_runner_loop(
             });
         }
 
-        // Garbage-collect cooldown entries for markets no longer in discovery list.
-        last_submit.retain(|id, _| markets_snapshot.iter().any(|m| &m.id == id));
+        // Garbage-collect cooldown entries.
+        //
+        // Namespaced keys ("{tag}::{id}") cover all current signals
+        // (BTC oracle/intramarket, props, devig, whale, lp_rewards,
+        // and event-arb event_ids). They aren't GC'd here — DashMap is
+        // in-memory and a few hundred entries' growth is negligible;
+        // process restart clears the map. Without this guard the
+        // previous predicate wiped event-arb keys EVERY tick because
+        // their format (`event-arb::<event_id>`) never matched a market_id
+        // in the snapshot — silently breaking the 1h portfolio cooldown.
+        //
+        // Bare-market keys (legacy, no "::") are still GC'd against the
+        // current markets snapshot; in normal operation no code path
+        // produces bare keys anymore.
+        last_submit.retain(|id, _| {
+            if id.contains("::") { return true; }
+            markets_snapshot.iter().any(|m| &m.id == id)
+        });
     }
 }
 
@@ -437,11 +489,19 @@ pub async fn run_one_tick(
     let mut handles = Vec::new();
     for (market_id, decision) in decisions {
         if matches!(decision, SignalDecision::None) { continue; }
-        if let Some(last) = last_submit.get(&market_id) {
+        // Mirror the production cooldown key format so tests exercise
+        // the same namespacing as execution_runner_loop.
+        let tag: &'static str = match &decision {
+            SignalDecision::Intramarket(_) => "intramarket",
+            SignalDecision::Oracle(_)      => "oracle",
+            SignalDecision::None           => "unknown",
+        };
+        let cd_key = format!("{}::{}", tag, market_id);
+        if let Some(last) = last_submit.get(&cd_key) {
             let dt_ms = now_ms.saturating_sub(*last);
             if dt_ms < runner_cfg.min_market_cooldown_secs * 1000 { continue; }
         }
-        last_submit.insert(market_id.clone(), now_ms);
+        last_submit.insert(cd_key, now_ms);
 
         let sign_c   = signing.clone();
         let risk_c   = risk.clone();
@@ -680,10 +740,12 @@ mod tests {
 
     #[tokio::test]
     async fn cooldown_per_market_isolation() {
-        // m1 in cooldown, m2 fresh — only m2 should fire
+        // m1 in cooldown, m2 fresh — only m2 should fire.
+        // Cooldown keys use "{strategy_tag}::{market_id}" format; the
+        // setup creates oracle signals so we use the "oracle" prefix.
         let (state, markets, signing, risk, client, positions, now_ms) = setup_two_markets().await;
         let last_submit = Arc::new(DashMap::new());
-        last_submit.insert("m1".to_string(), now_ms);   // pretend m1 just submitted
+        last_submit.insert("oracle::m1".to_string(), now_ms);
         let mut sig_cfg = SignalConfig::default();
         sig_cfg.min_window_age_secs = 0.0;
         let runner_cfg = RunnerConfig::default();

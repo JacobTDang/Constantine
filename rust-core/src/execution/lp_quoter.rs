@@ -195,6 +195,10 @@ pub enum QuoteReason {
     Initial,
     /// Skip — book is bad / mid undefined.
     NoMid,
+    /// No-op — current quotes are already at the right price and not
+    /// stale. Caller should skip cancel + repost entirely. Distinct
+    /// from Stale (which means "WAS at right price but now too old").
+    NoChange,
 }
 
 /// Decide what to quote given the current book and per-market state.
@@ -252,11 +256,13 @@ pub fn decide_quote(
         else if stale { QuoteReason::Stale }
         else if yes_moved || no_moved { QuoteReason::PriceMoved }
         else {
-            // No reason to refresh — keep current quotes
+            // No reason to refresh — keep current quotes. Caller MUST
+            // skip cancel + repost entirely (otherwise we'd hammer
+            // Polymarket on every tick with no-op quote churn).
             return QuoteDecision {
                 yes_bid_cents: Some(last_yes as u8),
                 no_bid_cents:  Some(last_no  as u8),
-                reason:        QuoteReason::Stale,    // sentinel; caller skips this case
+                reason:        QuoteReason::NoChange,
             };
         };
 
@@ -306,6 +312,19 @@ pub async fn refresh_market(
     let book = client.fetch_book(&market.yes_token_id).await
         .with_context(|| format!("fetch_book {}", market.yes_token_id))?;
     let decision = decide_quote(&book, cfg, &market.market, &market.state, now_ms);
+
+    // No-change case: prices and staleness window OK. Skip cancel +
+    // repost entirely — current quotes are still our best quotes.
+    // Without this short-circuit we'd hammer the API on every tick.
+    if decision.reason == QuoteReason::NoChange {
+        return Ok(RefreshOutcome {
+            market_id: market.market.condition_id.clone(),
+            canceled: 0, submitted: 0, accepted: 0, rejected: 0,
+            yes_quote_cents: decision.yes_bid_cents,
+            no_quote_cents:  decision.no_bid_cents,
+            reason: QuoteReason::NoChange,
+        });
+    }
 
     // No-mid case: pull existing quotes and skip
     if decision.reason == QuoteReason::NoMid {
@@ -606,7 +625,10 @@ mod tests {
         st.last_no_bid_cents .store(48, Ordering::SeqCst);
         st.last_refresh_ms   .store(1_000_000, Ordering::SeqCst);
         let d = decide_quote(&book, &sample_cfg(), &m, &st, 1_001_000);
-        // 1s elapsed < 5s max_stale and price unchanged -> sentinel return
+        // 1s elapsed < 5s max_stale and price unchanged -> NoChange.
+        // Caller (refresh_market) MUST short-circuit on NoChange so we
+        // don't cancel + repost the same quotes every tick.
+        assert_eq!(d.reason, QuoteReason::NoChange);
         assert_eq!(d.yes_bid_cents, Some(48));
         assert_eq!(d.no_bid_cents,  Some(48));
     }

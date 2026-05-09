@@ -405,10 +405,20 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Signal evaluation loop (E5) — every 500ms, picks intramarket > oracle
+    // Signal evaluation loop (E5) — every 500ms, picks intramarket > oracle.
+    // When execution is enabled the runner is the canonical source of truth
+    // for signals.jsonl (it sees ALL markets, not just the primary BTC one),
+    // so we disable signal_loop's DB persist in that mode to avoid double-
+    // logging the primary BTC market on every fired signal.
+    let mut sig_loop_cfg = signals::SignalConfig::default();
+    if let Ok(c) = &cfg_result {
+        if c.execution_enabled {
+            sig_loop_cfg.persist_to_db = false;
+        }
+    }
     tasks.spawn(signals::signal_loop(
         state.clone(),
-        signals::SignalConfig::default(),
+        sig_loop_cfg,
         signal_log.clone(),
     ));
 

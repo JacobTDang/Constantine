@@ -241,19 +241,41 @@ def match_market(market: dict, lines: list[GameLine]) -> GameLine | None:
     return best
 
 
+# Verbs that flip the YES-side semantics. "Will Lakers lose to Warriors?"
+# YES = Warriors winning, even though Lakers appears first in the question.
+# When any of these appear we can't trust the position-based heuristic,
+# so we abstain — the runner sees no signal rather than a wrong-direction
+# one. False negatives are cheap; false positives bet the wrong team.
+_NEGATION_VERBS = (
+    "lose", "loses", "losing", "lost",
+    "fall", "falls", "falling", "fell",
+    "miss", "misses", "missing", "missed",
+    "fail", "fails", "failing", "failed",
+    "drop", "drops", "dropping", "dropped",
+    "eliminat",   # eliminate / eliminated / elimination
+    "bow out",
+    "knock", "knocks", "knocked",     # "knocked out by"
+    "defeated by", "beaten by",
+    "upset by",
+)
+
+
 def classify_yes_team(question: str, line: GameLine) -> str | None:
     """Return 'home' or 'away' based on which team the market's YES side
-    represents. Look for "Will X win" or "X wins" patterns."""
+    represents. Returns None when the heuristic can't be trusted (negation
+    verbs, ambiguous phrasing) so the caller skips rather than guesses."""
     q = (question or "").lower()
+    if any(v in q for v in _NEGATION_VERBS):
+        return None
     home_last = line.home_team.split()[-1].lower()
     away_last = line.away_team.split()[-1].lower()
-    # Trivial heuristic: if home name appears first AND with a "win" verb,
-    # YES = home. Else if away first, YES = away. Reasonable default for
-    # standard "Will <Team> win against ..." Polymarket phrasing.
     home_idx = q.find(home_last)
     away_idx = q.find(away_last)
     if home_idx == -1 or away_idx == -1:
         return None
+    # Position heuristic: in "Will Lakers beat Warriors?" Lakers comes
+    # first → YES = Lakers (the subject). Same for "Lakers vs Warriors"
+    # without a verb (Polymarket convention puts YES-team first).
     if home_idx < away_idx:
         return "home"
     return "away"

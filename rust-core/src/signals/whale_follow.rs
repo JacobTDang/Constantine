@@ -82,23 +82,62 @@ impl WhaleCache {
 
     /// Read any new lines appended since the last call. Returns the
     /// number of new trades parsed.
+    ///
+    /// Robust to:
+    ///   - log rotation / truncation (file shorter than last_offset → reset)
+    ///   - \r\n vs \n line endings (uses raw byte counts, not str::len)
+    ///   - partial trailing line (we only advance offset to last full
+    ///     newline; the unfinished tail is re-read on the next refresh
+    ///     once the writer flushes its newline)
     pub fn refresh(&self, path: &Path) -> Result<usize> {
         if !path.exists() { return Ok(0); }
         let file = OpenOptions::new().read(true).open(path)?;
-        let mut reader = BufReader::new(file);
+        let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+
         let last = *self.last_offset.read().expect("poisoned");
-        reader.seek(SeekFrom::Start(last))?;
+        // Rotation / truncation: file shrunk below our offset. Reset and
+        // reread from the start. trade_id dedup keeps us from re-emitting
+        // anything we've already seen this process lifetime.
+        if file_len < last {
+            tracing::info!(
+                path = %path.display(), prev_offset = last, file_len,
+                "whale_trades.jsonl rotated/truncated; resetting offset"
+            );
+            *self.last_offset.write().expect("poisoned") = 0;
+        }
+
+        let mut reader = BufReader::new(file);
+        let start = *self.last_offset.read().expect("poisoned");
+        reader.seek(SeekFrom::Start(start))?;
 
         let mut new_trades = Vec::new();
-        let mut bytes_read: u64 = 0;
-        for line in reader.lines() {
-            let line: String = match line {
-                Ok(l) => l,
-                Err(_) => continue,
+        let mut last_complete_offset: u64 = start;
+        let mut buf: Vec<u8> = Vec::with_capacity(512);
+
+        loop {
+            buf.clear();
+            // read_until returns the actual bytes consumed (including the
+            // newline if found) — handles \r\n correctly because we count
+            // raw bytes rather than str::len of the trimmed result.
+            let n = match reader.read_until(b'\n', &mut buf) {
+                Ok(0) => break,             // EOF
+                Ok(n) => n,
+                Err(_) => break,
             };
-            bytes_read += line.len() as u64 + 1;     // +1 for newline
-            if line.is_empty() { continue; }
-            let trade: WhaleTrade = match serde_json::from_str(&line) {
+            // No newline in the chunk → partial trailing line. Don't
+            // advance offset past the start of this chunk so we re-read
+            // it after the writer flushes a newline.
+            if !buf.ends_with(b"\n") { break; }
+            // Strip trailing \r\n or \n for parsing
+            let mut end = n;
+            if end > 0 && buf[end - 1] == b'\n' { end -= 1; }
+            if end > 0 && buf[end - 1] == b'\r' { end -= 1; }
+            let line_bytes = &buf[..end];
+
+            last_complete_offset = last_complete_offset.saturating_add(n as u64);
+
+            if line_bytes.is_empty() { continue; }
+            let trade: WhaleTrade = match serde_json::from_slice(line_bytes) {
                 Ok(t) => t,
                 Err(e) => {
                     tracing::debug!(error = %e, "skip malformed whale row");
@@ -111,7 +150,7 @@ impl WhaleCache {
             drop(seen);
             new_trades.push(trade);
         }
-        *self.last_offset.write().expect("poisoned") = last + bytes_read;
+        *self.last_offset.write().expect("poisoned") = last_complete_offset;
         let n = new_trades.len();
         if n > 0 {
             self.pending.write().expect("poisoned").extend(new_trades);
@@ -360,6 +399,91 @@ mod tests {
         let cache = WhaleCache::new();
         std::fs::write(&path, "not json\n{}\n").unwrap();
         assert_eq!(cache.refresh(&path).unwrap(), 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn refresh_handles_crlf_line_endings() {
+        // Windows sidecar may write \r\n. The refresh must count raw
+        // bytes (not str::len) so the offset doesn't drift by 1/line.
+        let path = temp_path();
+        let cache = WhaleCache::new();
+        let now = chrono::Utc::now().timestamp_millis() as u64;
+        let t1 = sample_trade("BUY", "yes", 0.55, 5_000.0, now);
+        let t2 = sample_trade("BUY", "no",  0.40, 6_000.0, now);
+        // Manually craft CRLF JSONL
+        let line1 = serde_json::to_string(&serde_json::json!({
+            "trade_id": t1.trade_id, "whale_address": t1.whale_address,
+            "whale_nickname": t1.whale_nickname, "market_id": t1.market_id,
+            "asset_id": t1.asset_id, "side": t1.side, "outcome": t1.outcome,
+            "outcome_index": t1.outcome_index,
+            "price": t1.price, "size_shares": t1.size_shares,
+            "size_usd": t1.size_usd, "ts_ms": t1.ts_ms,
+        })).unwrap();
+        let line2 = serde_json::to_string(&serde_json::json!({
+            "trade_id": t2.trade_id, "whale_address": t2.whale_address,
+            "whale_nickname": t2.whale_nickname, "market_id": t2.market_id,
+            "asset_id": t2.asset_id, "side": t2.side, "outcome": t2.outcome,
+            "outcome_index": t2.outcome_index,
+            "price": t2.price, "size_shares": t2.size_shares,
+            "size_usd": t2.size_usd, "ts_ms": t2.ts_ms,
+        })).unwrap();
+        std::fs::write(&path, format!("{line1}\r\n{line2}\r\n")).unwrap();
+        let n = cache.refresh(&path).unwrap();
+        assert_eq!(n, 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn refresh_resets_offset_on_rotation() {
+        // Simulate logrotate: write file, refresh, truncate file, write
+        // fresh content. The cache should detect file_len < last_offset
+        // and re-read from byte 0.
+        let path = temp_path();
+        let cache = WhaleCache::new();
+        let now = chrono::Utc::now().timestamp_millis() as u64;
+        let t1 = sample_trade("BUY", "yes", 0.55, 5_000.0, now);
+        write_line(&path, &t1);
+        let n1 = cache.refresh(&path).unwrap();
+        assert_eq!(n1, 1);
+        // Simulate rotation: truncate + new content with a different trade_id
+        let mut t2 = sample_trade("BUY", "no", 0.40, 6_000.0, now);
+        t2.trade_id = "post-rotation".into();
+        std::fs::write(&path, "").unwrap();
+        write_line(&path, &t2);
+        let n2 = cache.refresh(&path).unwrap();
+        // dedup keeps t1 as already-seen, but t2 is new → n2 = 1
+        assert_eq!(n2, 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn refresh_holds_partial_trailing_line() {
+        // Sidecar mid-write: file ends without a newline. We should
+        // NOT advance offset past the start of that partial line, so
+        // the next refresh (after writer flushes \n) re-reads it.
+        let path = temp_path();
+        let cache = WhaleCache::new();
+        let now = chrono::Utc::now().timestamp_millis() as u64;
+        let t = sample_trade("BUY", "yes", 0.55, 5_000.0, now);
+        let line = serde_json::to_string(&serde_json::json!({
+            "trade_id": t.trade_id, "whale_address": t.whale_address,
+            "whale_nickname": t.whale_nickname, "market_id": t.market_id,
+            "asset_id": t.asset_id, "side": t.side, "outcome": t.outcome,
+            "outcome_index": t.outcome_index,
+            "price": t.price, "size_shares": t.size_shares,
+            "size_usd": t.size_usd, "ts_ms": t.ts_ms,
+        })).unwrap();
+        // Write WITHOUT trailing newline
+        std::fs::write(&path, &line).unwrap();
+        let n1 = cache.refresh(&path).unwrap();
+        assert_eq!(n1, 0, "partial line must not be parsed yet");
+        // Now finalize the line by appending the newline
+        let f = OpenOptions::new().append(true).open(&path).unwrap();
+        use std::io::Write as _;
+        (&f).write_all(b"\n").unwrap();
+        let n2 = cache.refresh(&path).unwrap();
+        assert_eq!(n2, 1, "completed line should now parse");
         let _ = std::fs::remove_file(&path);
     }
 
