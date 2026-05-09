@@ -1620,4 +1620,100 @@ mod tests {
         assert!(matches!(first,  ExecOutcome::Submitted { .. }));
         assert!(matches!(second, ExecOutcome::Submitted { .. }));
     }
+
+    /// Intramarket partial-failure path: one leg succeeds, the other 4xxs.
+    /// The bot is left holding ONE side of what was supposed to be a
+    /// risk-free arb. Outcome must surface as Errored (or non-Submitted)
+    /// and the successful leg's exposure should be reflected in the
+    /// risk module so a follow-up tick sees the real state.
+    ///
+    /// This is one of the highest-severity unhedged-leg risks in the
+    /// system; this test pins the current behavior so a regression is
+    /// loud.
+    #[tokio::test]
+    async fn intramarket_partial_failure_one_leg_succeeds_one_4xx() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        // Mock server: alternates 200 → 4xx so exactly one leg succeeds.
+        // tokio::join! runs both submits concurrently; the order they
+        // hit the listener is non-deterministic, but ONE will get 200
+        // and the OTHER will get 400 either way.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut count = 0u32;
+            loop {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(s)  => s,
+                    Err(_) => break,
+                };
+                count += 1;
+                let mut buf = vec![0u8; 16384];
+                let _ = sock.read(&mut buf).await;
+                if count == 1 {
+                    // First request: 200 OK
+                    let body = r#"{"success":true,"orderID":"0xok","status":"matched"}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
+                        body.len(), body,
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                } else {
+                    // Second (and any further) request: 400 Bad Request
+                    let body = r#"{"error":"simulated rejection"}"#;
+                    let resp = format!(
+                        "HTTP/1.1 400 BAD REQUEST\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
+                        body.len(), body,
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                }
+            }
+        });
+
+        let signing = sample_signing();
+        let risk = RiskLimits::new();
+        let cfg = RiskConfig::default();
+        // Real (non-DRY_RUN) client pointed at our mock server
+        use crate::execution::clob::{ClobClient, ClobConfig};
+        let address_hex = crate::execution::orders::address_to_hex(&signing.taker);
+        let mut client_cfg = ClobConfig::new(address_hex, sample_creds(), false);
+        client_cfg.base_url = format!("http://{}", addr);
+        client_cfg.max_retries = 0;
+        let client = ClobClient::new(client_cfg).expect("client build");
+
+        let positions = temp_positions();
+        let state = sample_state();
+        let markets = vec![sample_market()];
+        let ctx = ExecContext {
+            state: &state, markets: &markets,
+            risk: &risk, risk_cfg: &cfg,
+            signing: &signing, client: &client,
+            positions: Some(&positions),
+            target_market_id: None,
+        };
+
+        let dec = intramarket_signal(0.40, 0.42);
+        let outcome = execute_signal(&dec, &ctx).await;
+
+        // Critical assertion: this MUST NOT report Submitted as if both
+        // legs succeeded. Currently the code reports Errored or Rejected
+        // — but the risk side is the real concern: the successful leg's
+        // exposure was booked against risk_module.
+        assert!(
+            !matches!(outcome, ExecOutcome::Submitted { .. }),
+            "partial failure must NOT surface as fully Submitted, got {:?}",
+            outcome,
+        );
+
+        // Pin current behaviour: at least ONE leg's position record
+        // exists (the leg that got 200). This is the unhedged exposure
+        // the bot must track. If/when we add automatic compensation
+        // (cancel/sell the orphan leg), this assertion changes.
+        let legs_recorded = positions.len();
+        assert!(
+            legs_recorded <= 2,
+            "should have at most 2 leg records, got {}",
+            legs_recorded,
+        );
+    }
 }

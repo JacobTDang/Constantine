@@ -1005,6 +1005,76 @@ mod tests {
         assert_eq!(json.get("postOnly").unwrap().as_bool(), Some(true));
     }
 
+    #[test]
+    fn signed_to_wire_round_trip_preserves_recoverable_signer() {
+        // End-to-end: sign → wire encode → JSON → parse JSON → reconstruct
+        // a SignedOrder from the JSON values → recover_signer should match
+        // the address derived from TEST_PK. This catches any silent
+        // bytewise corruption between sign_order and the wire format
+        // (salt encoding, hex padding, signature byte order, etc).
+        use crate::execution::orders::{
+            private_key_to_address, recover_signer, u256_from_dec,
+            Domain, Order, SignedOrder,
+        };
+        let signed = sample_signed();
+        let body = build_submit_body(&signed, "owner-uuid", OrderType::Gtc, None).unwrap();
+        let json = serde_json::to_value(&body).unwrap();
+
+        // Pull the order subobject and reconstruct a SignedOrder from
+        // its JSON values exactly the way Polymarket's matcher would.
+        let o = json.get("order").expect("order subobject");
+        let salt_u64 = o.get("salt").unwrap().as_u64().expect("salt is JSON number");
+        // u256 fields stored as decimal strings in the wire body
+        let token_id = u256_from_dec(o.get("tokenId").unwrap().as_str().unwrap()).unwrap();
+        let maker_amount = u256_from_dec(o.get("makerAmount").unwrap().as_str().unwrap()).unwrap();
+        let taker_amount = u256_from_dec(o.get("takerAmount").unwrap().as_str().unwrap()).unwrap();
+        let expiration = u256_from_dec(o.get("expiration").unwrap().as_str().unwrap()).unwrap();
+        let nonce = u256_from_dec(o.get("nonce").unwrap().as_str().unwrap()).unwrap();
+        let fee_rate_bps = u256_from_dec(o.get("feeRateBps").unwrap().as_str().unwrap()).unwrap();
+        // Addresses come back as "0x..." strings
+        let maker = hex_to_address(o.get("maker").unwrap().as_str().unwrap()).unwrap();
+        let signer = hex_to_address(o.get("signer").unwrap().as_str().unwrap()).unwrap();
+        let taker = hex_to_address(o.get("taker").unwrap().as_str().unwrap()).unwrap();
+        // Signature is "0x" + 130 hex chars (65 bytes: r || s || v)
+        let sig_str = o.get("signature").unwrap().as_str().unwrap();
+        let sig_bytes = hex::decode(sig_str.trim_start_matches("0x")).unwrap();
+        assert_eq!(sig_bytes.len(), 65);
+        let mut signature = [0u8; 65];
+        signature.copy_from_slice(&sig_bytes);
+        // Reconstruct salt as 32 bytes (high 24 zero, low 8 = u64 BE)
+        let mut salt = [0u8; 32];
+        salt[24..].copy_from_slice(&salt_u64.to_be_bytes());
+        // Decode side enum
+        let side = match o.get("side").unwrap().as_str().unwrap() {
+            "BUY"  => crate::execution::orders::Side::Buy,
+            "SELL" => crate::execution::orders::Side::Sell,
+            other  => panic!("unknown side {other}"),
+        };
+        let signature_type = match o.get("signatureType").unwrap().as_u64().unwrap() {
+            0 => crate::execution::orders::SignatureType::Eoa,
+            1 => crate::execution::orders::SignatureType::PolyProxy,
+            2 => crate::execution::orders::SignatureType::PolyGnosis,
+            other => panic!("unknown signatureType {other}"),
+        };
+
+        let reconstructed = SignedOrder {
+            order: Order {
+                salt, maker, signer, taker,
+                token_id, maker_amount, taker_amount,
+                expiration, nonce, fee_rate_bps,
+                side, signature_type,
+            },
+            signature,
+        };
+
+        let domain = Domain::polymarket_polygon();
+        let recovered = recover_signer(&domain, &reconstructed)
+            .expect("recover_signer should succeed");
+        let expected = private_key_to_address(TEST_PK).expect("derive addr from TEST_PK");
+        assert_eq!(recovered, expected,
+            "recovered signer from JSON-roundtripped order must equal address derived from TEST_PK");
+    }
+
     // ── ClobApiResponse parsing ───────────────────────────────────────────
 
     #[test]

@@ -616,6 +616,53 @@ mod tests {
     }
 
     #[test]
+    fn decide_at_asymmetric_low_mid() {
+        // mid = 0.20, v = 3.5c, half-v = 1.75c.
+        // YES bid: target = 0.20 - 0.0175 = 0.1825 → 18 cents.
+        // NO  bid: target = (1 - 0.20) - 0.0175 = 0.7825 → 78 cents.
+        // (Computed as 1 - (mid + offset) = 1 - 0.2175 = 0.7825,
+        //  which equals (1 - mid) - offset by symmetry.)
+        let book = sample_book(0.20);
+        let m    = sample_market();
+        let st   = LpMarketState::default();
+        let d    = decide_quote(&book, &sample_cfg(), &m, &st, 0);
+        assert_eq!(d.yes_bid_cents, Some(18),
+            "YES bid at low-mid should be mid - offset");
+        assert_eq!(d.no_bid_cents,  Some(78),
+            "NO bid at low-mid should be (1-mid) - offset");
+    }
+
+    #[test]
+    fn decide_at_asymmetric_high_mid() {
+        // mid = 0.85, v = 3.5c, half-v = 1.75c.
+        // YES bid: 0.85 - 0.0175 = 0.8325 → 83 cents.
+        // NO  bid: (1 - 0.85) - 0.0175 = 0.1325 → 13 cents.
+        let book = sample_book(0.85);
+        let m    = sample_market();
+        let st   = LpMarketState::default();
+        let d    = decide_quote(&book, &sample_cfg(), &m, &st, 0);
+        assert_eq!(d.yes_bid_cents, Some(83));
+        assert_eq!(d.no_bid_cents,  Some(13));
+    }
+
+    #[test]
+    fn decide_clamps_extreme_mids_to_legal_price_range() {
+        // Mid right at the top of the book — yes_bid would compute to
+        // 99.5c which clamps to 99c. NO bid would compute to ~0.5c
+        // which clamps to 1c. No panics, no out-of-range prices.
+        let book = sample_book(0.99);
+        let m    = sample_market();
+        let st   = LpMarketState::default();
+        let d    = decide_quote(&book, &sample_cfg(), &m, &st, 0);
+        let yes = d.yes_bid_cents.expect("should quote");
+        let no  = d.no_bid_cents.expect("should quote");
+        assert!((1..=99).contains(&yes),
+            "yes_cents must be in [1,99], got {yes}");
+        assert!((1..=99).contains(&no),
+            "no_cents must be in [1,99], got {no}");
+    }
+
+    #[test]
     fn decide_pulls_both_when_yes_inventory_capped() {
         // Single-side cap-violation also implies combined cap-violation
         // (since combined = yes + no ≥ yes, and yes ≥ cap). New
