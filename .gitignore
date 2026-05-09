@@ -28,6 +28,9 @@ data/db/*.sqlite
 data/db/*.jsonl
 data/raw/
 data/research/
+# User-curated whale list — addresses are personal; don't commit
+data/whale_wallets.json
+data/.whale_seen.json
 
 # IDE / tools
 .vscode/

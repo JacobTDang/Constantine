@@ -232,6 +232,10 @@ async fn main() -> anyhow::Result<()> {
                     min_ask_depth_usd:       50.0,
                     max_touch_consumption:   0.5,
                     max_bet_dollars:         c.max_bet_dollars,
+                    // Per-tick eval used by the runner; signal_loop has
+                    // its own SignalConfig where persist_to_db gates
+                    // double-logging. Doesn't matter here either way.
+                    persist_to_db:           true,
                 };
                 // Strategy 1: NBA player-prop projections cache. Reloaded
                 // every 30s from data/nba_projections.json. The Python
