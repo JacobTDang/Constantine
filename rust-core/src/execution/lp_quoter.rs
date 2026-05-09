@@ -144,7 +144,12 @@ pub struct LpQuoterCache {
 }
 
 impl LpQuoterCache {
-    pub async fn replace(&self, fresh: Vec<LpMarket>) {
+    /// Replace the cached market set with `fresh` (typically pulled by
+    /// the discovery loop from `/rewards/markets/current`). Returns the
+    /// list of condition_ids that were EVICTED (in old set, not in
+    /// new). Caller is expected to cancel resting orders for evicted
+    /// markets so they don't sit on Polymarket's books indefinitely.
+    pub async fn replace(&self, fresh: Vec<LpMarket>) -> Vec<String> {
         let mut g = self.markets.write().await;
         let mut new_map = HashMap::with_capacity(fresh.len());
         for m in fresh {
@@ -162,7 +167,13 @@ impl LpQuoterCache {
                 new_map.insert(m.market.condition_id.clone(), m);
             }
         }
+        // Compute eviction list before swap.
+        let evicted: Vec<String> = g.keys()
+            .filter(|cid| !new_map.contains_key(*cid))
+            .cloned()
+            .collect();
         *g = new_map;
+        evicted
     }
 
     pub async fn snapshot(&self) -> Vec<LpMarket> {
@@ -231,11 +242,15 @@ pub fn decide_quote(
     let yes_cents = (target_yes_bid * 100.0).round().clamp(1.0, 99.0) as u8;
     let no_cents  = (target_no_bid  * 100.0).round().clamp(1.0, 99.0) as u8;
 
-    // Inventory caps
+    // Inventory caps. Two-sided LP quoting can dual-fill — both BUY
+    // YES and BUY NO orders execute independently, leaving us holding
+    // $X YES AND $X NO simultaneously (capital-locked, net-neutral).
+    // Per-side caps don't catch this; we also check combined.
     let yes_inv = state.yes_inventory_dollars();
     let no_inv  = state.no_inventory_dollars();
-    let yes_overcap = yes_inv >= cfg.inventory_cap_usd;
-    let no_overcap  = no_inv  >= cfg.inventory_cap_usd;
+    let yes_overcap      = yes_inv >= cfg.inventory_cap_usd;
+    let no_overcap       = no_inv  >= cfg.inventory_cap_usd;
+    let combined_overcap = (yes_inv + no_inv) >= cfg.inventory_cap_usd;
 
     // Should we re-quote?
     let last_yes = state.last_yes_bid_cents.load(Ordering::SeqCst);
@@ -250,8 +265,9 @@ pub fn decide_quote(
         ((no_cents  as i64 - last_no ).unsigned_abs() as u8) >= cfg.repost_threshold_cents;
 
     // Inventory cap takes priority over every other condition: a side
-    // that's over the cap must be pulled regardless of refresh trigger.
-    let reason = if yes_overcap || no_overcap { QuoteReason::InventoryCapped }
+    // (or combined) that's over the cap must be pulled regardless of
+    // refresh trigger.
+    let reason = if yes_overcap || no_overcap || combined_overcap { QuoteReason::InventoryCapped }
         else if initial { QuoteReason::Initial }
         else if stale { QuoteReason::Stale }
         else if yes_moved || no_moved { QuoteReason::PriceMoved }
@@ -267,8 +283,9 @@ pub fn decide_quote(
         };
 
     QuoteDecision {
-        yes_bid_cents: if yes_overcap { None } else { Some(yes_cents) },
-        no_bid_cents:  if no_overcap  { None } else { Some(no_cents)  },
+        // Combined-cap pulls BOTH sides; per-side cap pulls just that side.
+        yes_bid_cents: if yes_overcap || combined_overcap { None } else { Some(yes_cents) },
+        no_bid_cents:  if no_overcap  || combined_overcap { None } else { Some(no_cents)  },
         reason,
     }
 }
@@ -520,8 +537,28 @@ pub async fn lp_discovery_loop(
                     if keepers.len() >= cfg.max_markets { break; }
                 }
                 let n = keepers.len();
-                cache.replace(keepers).await;
-                tracing::info!(n, "lp quoter: discovery refreshed");
+                let evicted = cache.replace(keepers).await;
+                let n_evicted = evicted.len();
+                tracing::info!(n, n_evicted, "lp quoter: discovery refreshed");
+                // Cancel resting orders for evicted markets so they don't
+                // sit on Polymarket's books accumulating risk after they
+                // dropped out of the rewards programme. Spawn so the
+                // discovery cadence isn't blocked by N HTTP calls; errors
+                // are logged + swallowed (worst case the orders rest until
+                // their natural expiry / next maintenance pass).
+                for cid in evicted {
+                    let cl = client.clone();
+                    tokio::spawn(async move {
+                        match cl.cancel_orders_by_market(&cid).await {
+                            Ok(n) if n > 0 => tracing::info!(
+                                market = %cid, canceled = n,
+                                "lp quoter: cancelled evicted-market orders"),
+                            Ok(_) => {},
+                            Err(e) => tracing::warn!(market = %cid, error = %e,
+                                "lp quoter: cancel-on-eviction failed"),
+                        }
+                    });
+                }
             }
             Err(e) => tracing::warn!(error = %e, "lp quoter discovery failed"),
         }
@@ -579,7 +616,14 @@ mod tests {
     }
 
     #[test]
-    fn decide_pulls_yes_when_yes_inventory_capped() {
+    fn decide_pulls_both_when_yes_inventory_capped() {
+        // Single-side cap-violation also implies combined cap-violation
+        // (since combined = yes + no ≥ yes, and yes ≥ cap). New
+        // behavior: pull BOTH sides when capital is locked, regardless
+        // of which side caused it. Buying the OTHER side only adds
+        // inventory; we can't sell back to reduce, so the safe move is
+        // to stop quoting until fills clear (= dual-redeem after market
+        // resolves) or the user manually intervenes.
         let book = sample_book(0.50);
         let m    = sample_market();
         let st   = LpMarketState::default();
@@ -587,11 +631,11 @@ mod tests {
         let d = decide_quote(&book, &sample_cfg(), &m, &st, 0);
         assert_eq!(d.reason, QuoteReason::InventoryCapped);
         assert!(d.yes_bid_cents.is_none());
-        assert!(d.no_bid_cents.is_some());
+        assert!(d.no_bid_cents.is_none());
     }
 
     #[test]
-    fn decide_pulls_no_when_no_inventory_capped() {
+    fn decide_pulls_both_when_no_inventory_capped() {
         let book = sample_book(0.50);
         let m    = sample_market();
         let st   = LpMarketState::default();
@@ -599,7 +643,7 @@ mod tests {
         let d = decide_quote(&book, &sample_cfg(), &m, &st, 0);
         assert_eq!(d.reason, QuoteReason::InventoryCapped);
         assert!(d.no_bid_cents.is_none());
-        assert!(d.yes_bid_cents.is_some());
+        assert!(d.yes_bid_cents.is_none());
     }
 
     #[test]
@@ -704,17 +748,39 @@ mod tests {
                 yes_token_id: "y2".into(), no_token_id: "n2".into(),
                 state: Arc::new(LpMarketState::default()),
             };
-            cache.replace(vec![m1, m2]).await;
+            // First insert: nothing evicted (cache was empty).
+            let evicted_initial = cache.replace(vec![m1, m2]).await;
+            assert!(evicted_initial.is_empty());
             assert_eq!(cache.len().await, 2);
-            // Next discovery only returns A
+            // Next discovery only returns A → B should be in evicted list.
             let m1b = LpMarket {
                 market: RewardMarket { condition_id: "A".into(), ..sample_market() },
                 yes_token_id: "y1".into(), no_token_id: "n1".into(),
                 state: Arc::new(LpMarketState::default()),
             };
-            cache.replace(vec![m1b]).await;
+            let evicted = cache.replace(vec![m1b]).await;
             assert_eq!(cache.len().await, 1);
+            assert_eq!(evicted, vec!["B".to_string()]);
         });
+    }
+
+    #[test]
+    fn decide_pulls_both_sides_on_combined_inventory_cap() {
+        // Dual-fill scenario: $250 YES + $250 NO = $500 combined.
+        // Per-side caps both pass (each below $400 cap), but combined
+        // exceeds. Both sides should be pulled.
+        let book = sample_book(0.50);
+        let m    = sample_market();
+        let st   = LpMarketState::default();
+        st.record_yes_fill(250.0);
+        st.record_no_fill(250.0);
+        let d = decide_quote(&book, &sample_cfg(), &m, &st, 0);
+        assert_eq!(d.reason, QuoteReason::InventoryCapped,
+            "combined yes+no inventory above cap must trip InventoryCapped");
+        assert!(d.yes_bid_cents.is_none(),
+            "YES side must be pulled on combined cap");
+        assert!(d.no_bid_cents.is_none(),
+            "NO side must be pulled on combined cap");
     }
 
     #[test]

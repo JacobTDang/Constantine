@@ -145,16 +145,40 @@ impl PositionStore {
         let f = std::fs::File::open(&self.path)
             .with_context(|| format!("open {}", self.path.display()))?;
         let mut count = 0;
+        let mut corrupt = 0;
+        // Per-line try-parse: a single torn line on power-loss or a
+        // schema-mismatch on upgrade should NOT brick the bot's
+        // ability to recover prior positions. Skip + warn rather
+        // than bubbling up.
         for (line_no, line) in BufReader::new(f).lines().enumerate() {
-            let line = line.with_context(|| format!("read line {} of {}", line_no, self.path.display()))?;
+            let line = match line {
+                Ok(l) => l,
+                Err(e) => {
+                    corrupt += 1;
+                    tracing::warn!(line = line_no, error = %e,
+                        "positions.jsonl: read error, skipping line");
+                    continue;
+                }
+            };
             if line.trim().is_empty() { continue; }
-            let event: PositionEvent = serde_json::from_str(&line)
-                .with_context(|| format!("parse line {}", line_no))?;
+            let event: PositionEvent = match serde_json::from_str(&line) {
+                Ok(ev) => ev,
+                Err(e) => {
+                    corrupt += 1;
+                    tracing::warn!(line = line_no, error = %e,
+                        "positions.jsonl: parse error, skipping line");
+                    continue;
+                }
+            };
             self.apply(event);
             count += 1;
         }
-        if count > 0 {
-            tracing::info!(events = count, file = %self.path.display(), "replayed position log");
+        if count > 0 || corrupt > 0 {
+            tracing::info!(
+                events = count, corrupt_lines = corrupt,
+                file = %self.path.display(),
+                "replayed position log"
+            );
         }
         Ok(())
     }
@@ -607,6 +631,27 @@ mod tests {
              \n").unwrap();
         let store = PositionStore::open(&dir).unwrap();
         assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn replay_tolerates_corrupt_lines() {
+        // Power loss or upgrade-time schema mismatch can leave torn or
+        // unparseable lines in positions.jsonl. The bot must boot
+        // anyway — replay logs warnings and continues.
+        let dir = temp_dir();
+        let path = dir.join("positions.jsonl");
+        std::fs::write(&path,
+            "{\"kind\":\"open\",\"event_at_ms\":1,\"order_id\":\"a\",\"market_id\":\"m\",\"side\":\"yes\",\"bet_dollars\":5.0,\"price\":0.5}\n\
+             not a json line at all\n\
+             {\"kind\":\"open\",\"event_at_ms\":2,\"order_id\":\"b\",\"market_id\":\"m\",\"side\":\"no\",\"bet_dollars\":7.0,\"price\":0.3}\n\
+             {\"kind\":\"unknown_variant\"}\n\
+             {\"kind\":\"open\",\"event_at_ms\":3,\"order_id\":\"c\",\"market_id\":\"m\",\"side\":\"yes\",\"bet_dollars\":4.0,\"price\":0.6}\n").unwrap();
+        let store = PositionStore::open(&dir).unwrap();
+        // 3 valid Open events; 2 corrupt lines skipped, store still loads
+        assert_eq!(store.len(), 3);
+        assert!(store.get("a").is_some());
+        assert!(store.get("b").is_some());
+        assert!(store.get("c").is_some());
     }
 
     // ── Readers ────────────────────────────────────────────────────────────

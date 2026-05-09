@@ -184,10 +184,30 @@ pub async fn allowance_watchdog_loop(
         "allowance watchdog started"
     );
 
+    // Local state tracking so we know when WE tripped the kill switch
+    // vs another subsystem. Auto-recovery only resets the switch when
+    // the trip was due to OUR cause and our cause is now resolved.
+    //
+    // tripped_by_us: true while the kill switch is active because of
+    //   either low allowance OR sustained RPC failure detected here.
+    // consecutive_rpc_failures: counter for D1 (trip after threshold).
+    let mut tripped_by_us = false;
+    let mut consecutive_rpc_failures: u32 = 0;
+    const RPC_FAILURE_TRIP_THRESHOLD: u32 = 5;
+
     loop {
         tick.tick().await;
         match query_allowance(&cfg, &http).await {
             Ok(reading) => {
+                // Reset the RPC failure counter on any successful read.
+                if consecutive_rpc_failures > 0 {
+                    tracing::info!(
+                        prior_failures = consecutive_rpc_failures,
+                        "allowance RPC recovered"
+                    );
+                    consecutive_rpc_failures = 0;
+                }
+
                 if reading.usdc_dollars < cfg.min_allowance_usdc {
                     tracing::error!(
                         usdc = reading.usdc_dollars,
@@ -196,17 +216,53 @@ pub async fn allowance_watchdog_loop(
                     );
                     if cfg.trip_kill_switch && !risk.is_kill_switch_active() {
                         risk.activate_kill_switch();
+                        tripped_by_us = true;
                     }
                 } else {
-                    tracing::info!(
-                        usdc = reading.usdc_dollars,
-                        "allowance OK"
-                    );
+                    // Healthy allowance reading. If WE tripped the switch
+                    // earlier (low allowance or RPC outage), auto-recover
+                    // now that conditions have cleared. Don't reset
+                    // switches tripped by other subsystems (loss limits,
+                    // manual activation, etc.) — we have no way to tell
+                    // post-hoc, so we only reset what we know we tripped.
+                    if tripped_by_us && risk.is_kill_switch_active() {
+                        tracing::warn!(
+                            usdc = reading.usdc_dollars,
+                            "allowance recovered — auto-resetting kill switch"
+                        );
+                        risk.reset_kill_switch();
+                        tripped_by_us = false;
+                    } else {
+                        tracing::info!(
+                            usdc = reading.usdc_dollars,
+                            "allowance OK"
+                        );
+                    }
                 }
             }
             Err(e) => {
-                tracing::warn!(error = %e, "allowance query failed");
-                // Don't trip on a single RPC failure — could be a hiccup.
+                consecutive_rpc_failures += 1;
+                tracing::warn!(
+                    error = %e,
+                    consecutive = consecutive_rpc_failures,
+                    "allowance query failed"
+                );
+                // Sustained RPC outage = trade blind. Trip after N
+                // consecutive failures so a transient hiccup doesn't
+                // halt trading but a real outage does.
+                if cfg.trip_kill_switch
+                    && consecutive_rpc_failures >= RPC_FAILURE_TRIP_THRESHOLD
+                    && !risk.is_kill_switch_active()
+                {
+                    tracing::error!(
+                        consecutive = consecutive_rpc_failures,
+                        "allowance: RPC unavailable for {} polls — \
+                         tripping kill switch",
+                        consecutive_rpc_failures
+                    );
+                    risk.activate_kill_switch();
+                    tripped_by_us = true;
+                }
             }
         }
     }

@@ -110,6 +110,19 @@ pub async fn execute_event_arb(
         };
     }
 
+    // Per-strategy kill switch — distinct from the global kill checked
+    // by `can_trade` below. Lets us halt event-arb specifically without
+    // taking the whole bot down.
+    if ctx_risk.is_strategy_killed(crate::risk::limits::Strategy::EventArb) {
+        tracing::warn!(event = %edge.title,
+            "event arb skipped — strategy kill switch active");
+        return PortfolioOutcome {
+            event_id: edge.event_id.clone(),
+            title:    edge.title.clone(),
+            legs:     vec![],
+        };
+    }
+
     // Per-leg sizing
     let per_leg = (cfg.event_budget_usd / n as f64).max(cfg.min_leg_dollars);
     let total_bet = per_leg * n as f64;

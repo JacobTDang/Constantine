@@ -35,9 +35,19 @@ use tokio::time::{sleep, Duration};
 
 use crate::execution::auth::{auth_headers, ApiCreds};
 use crate::storage::PositionStore;
+use crate::streams::binance::next_backoff;
 
 const WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/user";
-const RECONNECT_BACKOFF_SECS: u64 = 5;
+
+// Reconnect backoff schedule. First attempt waits BACKOFF_MIN; each
+// subsequent failure doubles up to BACKOFF_MAX. Successful reads reset.
+const BACKOFF_MIN: Duration = Duration::from_secs(2);
+const BACKOFF_MAX: Duration = Duration::from_secs(60);
+
+// Read timeout: half-open TCP (NAT idle, server crashed without close
+// frame) hangs ws.next() until OS-level keepalive eventually fires —
+// can be 1-2 hours on default Linux. We bound it.
+const READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// One parsed event from the Polymarket user channel.
 ///
@@ -179,6 +189,18 @@ pub fn dispatch_event(positions: &PositionStore, event: &UserStreamEvent) -> Res
                     tracing::warn!("trade event with empty order_id, skipping");
                     return Ok(false);
                 }
+                // Orphan check: a fill for an order_id we don't have
+                // locally (e.g. session-rotated JSONL, prior bot run,
+                // someone else's wallet mirroring weirdness). Skip
+                // rather than appending an Open-less Fill row that
+                // can't be replayed and pollutes JSONL analytics.
+                if positions.get(order_id).is_none() {
+                    tracing::info!(
+                        order_id = %order_id, price, size, status = %status,
+                        "orphan fill — no matching local Open, skipping"
+                    );
+                    return Ok(false);
+                }
                 positions.record_fill(order_id, *price, *size)
                     .with_context(|| format!("record_fill for {order_id}"))?;
                 tracing::info!(
@@ -257,18 +279,42 @@ pub async fn user_stream_loop(
         }
     };
 
+    let mut backoff = BACKOFF_MIN;
     loop {
         tracing::info!(markets = condition_ids.len(), "connecting to Polymarket user stream");
         match tokio_tungstenite::connect_async(WS_URL).await {
             Ok((mut ws, _resp)) => {
                 if let Err(e) = ws.send(Message::Text(subscribe.clone())).await {
                     tracing::error!(error = %e, "subscribe send failed — reconnecting");
-                    sleep(Duration::from_secs(RECONNECT_BACKOFF_SECS)).await;
+                    backoff = next_backoff(backoff, BACKOFF_MAX);
+                    sleep(backoff).await;
                     continue;
                 }
 
-                while let Some(frame) = ws.next().await {
-                    match frame {
+                // Successful connect + subscribe — reset backoff so a
+                // long-stable connection that drops doesn't start at
+                // the previous failure backoff.
+                backoff = BACKOFF_MIN;
+
+                loop {
+                    // Wrap ws.next() in a read timeout: half-open TCP
+                    // would otherwise hang here for hours waiting on
+                    // OS keepalive. Treat timeout as connection lost.
+                    let frame_res = match tokio::time::timeout(READ_TIMEOUT, ws.next()).await {
+                        Ok(Some(frame)) => frame,
+                        Ok(None) => {
+                            tracing::warn!("user stream returned None — server closed");
+                            break;
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                timeout_secs = READ_TIMEOUT.as_secs(),
+                                "user stream read timeout — assuming half-open, reconnecting"
+                            );
+                            break;
+                        }
+                    };
+                    match frame_res {
                         Ok(Message::Text(text)) => {
                             match parse_user_message(&text) {
                                 Ok(events) => {
@@ -302,7 +348,9 @@ pub async fn user_stream_loop(
         }
         // address kept on the loop for future signed-subscribe variants
         let _ = &address;
-        sleep(Duration::from_secs(RECONNECT_BACKOFF_SECS)).await;
+        backoff = next_backoff(backoff, BACKOFF_MAX);
+        tracing::info!(secs = backoff.as_secs(), "reconnecting after backoff");
+        sleep(backoff).await;
     }
 }
 
@@ -465,6 +513,26 @@ mod tests {
         // Still Submitted, no fill recorded
         let p = store.get("ord-1").unwrap();
         assert_eq!(p.status, crate::storage::PositionStatus::Submitted);
+    }
+
+    #[test]
+    fn dispatch_skips_orphan_fill_without_local_open() {
+        // No prior record_open — simulating a fill arriving for an
+        // order_id we don't have locally (rotated JSONL, prior session,
+        // or unrelated wallet activity). Should be skipped, not
+        // recorded as a Fill row.
+        let store = PositionStore::open(&temp_dir()).unwrap();
+        let ev = UserStreamEvent::Trade {
+            order_id: "no-local-open".into(),
+            asset_id: "asset".into(),
+            price: 0.46, size: 11.0, side: "BUY".into(),
+            status: "MATCHED".into(),
+            timestamp_ms: 1_000,
+        };
+        let changed = dispatch_event(&store, &ev).unwrap();
+        assert!(!changed, "orphan fill must not record state change");
+        // Store has zero positions (open was never called)
+        assert_eq!(store.len(), 0);
     }
 
     #[test]

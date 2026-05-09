@@ -156,6 +156,22 @@ pub fn evaluate_devig(row: &DevigRow, now_ms: u64) -> SignalDecision {
 
     let secs_to_close = (end_ms.saturating_sub(now_ms) / 1_000) as f64;
 
+    // Sanity: BOTH edges shouldn't exceed MIN_EDGE simultaneously.
+    // Pinnacle's no-vig probabilities sum to 1, so by construction
+    // edge_yes + edge_no = (yes_bid - yes_ask) ≈ -spread (slightly
+    // negative). If the sidecar reports both > MIN_EDGE the input
+    // is internally inconsistent — refuse the trade rather than
+    // pick the larger one and bet wrong-direction.
+    if row.edge_yes >= MIN_EDGE && row.edge_no >= MIN_EDGE {
+        tracing::warn!(
+            condition_id = %row.condition_id,
+            edge_yes = row.edge_yes,
+            edge_no  = row.edge_no,
+            "sportsbook_devig: dual-edge inconsistency — refusing signal"
+        );
+        return SignalDecision::None;
+    }
+
     // Buy YES if Pinnacle says the home/correct side is underpriced
     if row.edge_yes >= MIN_EDGE {
         return SignalDecision::Oracle(OracleArbSignal {
@@ -265,6 +281,17 @@ mod tests {
         let row = sample_row(0.01, 0.01);
         let d = evaluate_devig(&row, 1_000);
         assert!(matches!(d, SignalDecision::None));
+    }
+
+    #[test]
+    fn no_signal_when_both_edges_above_threshold() {
+        // Inconsistent input: sidecar reports both YES + NO underpriced
+        // simultaneously, which can't be true with no-vig probabilities
+        // summing to 1. Refuse the signal rather than picking arbitrarily.
+        let row = sample_row(0.10, 0.10);
+        let d = evaluate_devig(&row, 1_000);
+        assert!(matches!(d, SignalDecision::None),
+            "dual-edge inconsistency must produce no signal");
     }
 
     #[test]
