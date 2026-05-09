@@ -234,7 +234,13 @@ impl PositionStore {
             .open(&self.path)
             .with_context(|| format!("open {}", self.path.display()))?;
         writeln!(f, "{line}").context("write event")?;
+        // flush() drains the user-space buffer; sync_data() forces the
+        // OS to commit the write to disk. Without sync_data, a power
+        // loss between flush and the OS's lazy writeback (seconds) loses
+        // every position event written in that window. Cost is ~ms per
+        // call on SSD, acceptable for our throughput (few per minute).
         f.flush().context("flush")?;
+        f.sync_data().context("sync_data")?;
         Ok(())
     }
 
@@ -446,6 +452,10 @@ impl PositionStore {
                             report.rpc_errors += 1;
                         } else {
                             report.failed_late += 1;
+                            // Accumulate so the caller releases the
+                            // exposure that record_open booked when the
+                            // order was first submitted. F11 fix.
+                            report.bet_dollars_to_release += p.bet_dollars;
                         }
                     }
                 }
@@ -490,7 +500,9 @@ impl PositionStore {
 /// Outcome counts from one reconciliation pass. All counters are
 /// per-pending-position, so they sum to `checked - skipped_local` minus
 /// any rpc_errors that aborted early.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+// Drop Eq because bet_dollars_to_release is f64 (no total order).
+// PartialEq is enough for tests.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct ReconcileReport {
     /// Total pending positions inspected.
     pub checked:       usize,
@@ -508,6 +520,12 @@ pub struct ReconcileReport {
     /// RPC failures during the call. Reconciliation degrades gracefully —
     /// these are reported, not raised.
     pub rpc_errors:    usize,
+    /// Sum of `bet_dollars` for positions transitioned to Failed in this
+    /// pass. Caller must call `risk.release_exposure(this)` to free the
+    /// exposure that `record_open` had pessimistically booked. Without
+    /// this release, every cancelled/rejected order leaks exposure
+    /// permanently.
+    pub bet_dollars_to_release: f64,
 }
 
 #[derive(Debug, Clone, Copy)]

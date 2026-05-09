@@ -6,8 +6,10 @@
 //
 // Why JSONL instead of SQLite: Windows-GNU Rust toolchain doesn't ship gcc,
 // and rusqlite's bundled feature requires it. JSONL works without any C deps,
-// is trivially readable by pandas/jq for analysis, and is append-only durable
-// (one fsync per write — no transaction concerns).
+// is trivially readable by pandas/jq for analysis, and is append-only durable.
+// Each writer (insert_signal, insert_settlement, PositionStore::append) calls
+// f.flush() + f.sync_data() to force OS-level writeback before returning, so
+// a power loss between writes loses at most the line being written.
 //
 // Settlement reconciliation (computing realised P&L for each signal) happens
 // at analysis time via the Python reporter (scripts/observe_report.py),
@@ -144,7 +146,10 @@ impl SignalLog {
             .open(&self.signals_path)
             .with_context(|| format!("opening {}", self.signals_path.display()))?;
         writeln!(f, "{line}").context("writing signal")?;
+        // flush() drains user-space; sync_data() forces OS write to disk.
+        // Without it, a power loss can lose seconds of signals.
         f.flush().context("flushing signal")?;
+        f.sync_data().context("syncing signal")?;
         Ok(())
     }
 
@@ -158,6 +163,7 @@ impl SignalLog {
             .with_context(|| format!("opening {}", self.settlements_path.display()))?;
         writeln!(f, "{line}").context("writing settlement")?;
         f.flush().context("flushing settlement")?;
+        f.sync_data().context("syncing settlement")?;
         Ok(())
     }
 

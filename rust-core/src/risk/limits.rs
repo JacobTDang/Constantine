@@ -230,6 +230,25 @@ impl RiskLimits {
         self.daily_trade_count.fetch_add(1, Ordering::SeqCst);
     }
 
+    /// Release the exposure that was booked at `record_open` without
+    /// recording any P&L. Call this when a position is resolved as
+    /// CANCELLED / FAILED / REJECTED — the order didn't actually take
+    /// any economic exposure (no fill), but `record_open` had
+    /// pessimistically booked it for the in-flight period. Without
+    /// this release, every cancelled order leaks exposure permanently.
+    pub fn release_exposure(&self, bet_dollars: f64) {
+        if bet_dollars.is_finite() && bet_dollars > 0.0 {
+            let cents = (bet_dollars * 100.0).round() as i64;
+            self.open_exposure_cents.fetch_sub(cents, Ordering::SeqCst);
+            // Floor at 0 — rounding error or double-release shouldn't
+            // produce negative exposure.
+            let v = self.open_exposure_cents.load(Ordering::SeqCst);
+            if v < 0 {
+                self.open_exposure_cents.store(0, Ordering::SeqCst);
+            }
+        }
+    }
+
     /// Call this when a position resolves. Pass the original `bet_dollars`
     /// (so exposure can be released) and `pnl_dollars` (negative = loss).
     /// Auto-trips the kill switch if daily/weekly loss limits are exceeded.
@@ -685,6 +704,35 @@ mod tests {
         let r = RiskLimits::new();
         r.record_open(20.0);
         r.record_close(20.0, 5.0, &cfg());
+        assert!((r.open_exposure_dollars() - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn release_exposure_drops_count_without_pnl() {
+        // F11: when reconcile marks an order as Failed (cancelled /
+        // rejected before any fill), exposure must be released without
+        // recording any P&L. Otherwise the position-store-side bookkeeping
+        // leaks exposure on every cancelled order detected late.
+        let r = RiskLimits::new();
+        r.record_open(20.0);
+        r.record_open(15.0);
+        assert!((r.open_exposure_dollars() - 35.0).abs() < 1e-6);
+        // Failed-late one of them
+        r.release_exposure(20.0);
+        assert!((r.open_exposure_dollars() - 15.0).abs() < 1e-6);
+        // P&L untouched (no loss/gain — order never filled)
+        assert!((r.realised_pnl_dollars() - 0.0).abs() < 1e-6);
+        assert!((r.daily_loss_dollars() - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn release_exposure_floors_at_zero() {
+        // Defensive: rounding error or double-release shouldn't produce
+        // negative exposure.
+        let r = RiskLimits::new();
+        r.record_open(10.0);
+        r.release_exposure(10.0);
+        r.release_exposure(10.0);   // double release
         assert!((r.open_exposure_dollars() - 0.0).abs() < 1e-6);
     }
 

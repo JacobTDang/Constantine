@@ -325,8 +325,23 @@ impl ClobClient {
             }
 
             if attempt < total_attempts {
-                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                backoff_ms = backoff_ms.saturating_mul(2);
+                // Apply ±20% jitter to avoid synchronized retries from
+                // multiple in-flight callers (thundering herd). Cheap
+                // pseudo-random source: nanoseconds-mod-1000 — good
+                // enough for de-correlating retries; we don't need
+                // cryptographic randomness here.
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.subsec_nanos() as u64)
+                    .unwrap_or(0);
+                let jitter_unit = (nanos % 1000) as f64 / 1000.0; // 0.0..1.0
+                let jitter = 0.8 + 0.4 * jitter_unit;             // 0.8..1.2
+                let wait_ms = ((backoff_ms as f64) * jitter) as u64;
+                tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+                // Cap at MAX_BACKOFF_MS so a misconfigured max_retries
+                // doesn't blow up to many seconds of sleep.
+                const MAX_BACKOFF_MS: u64 = 30_000;
+                backoff_ms = backoff_ms.saturating_mul(2).min(MAX_BACKOFF_MS);
             }
         }
 

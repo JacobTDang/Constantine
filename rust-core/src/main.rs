@@ -320,14 +320,24 @@ async fn main() -> anyhow::Result<()> {
                         .reconcile_with_polymarket(&client, &address_for_reconcile)
                         .await
                     {
-                        Ok(r) => tracing::info!(
-                            checked = r.checked,
-                            filled_late = r.filled_late,
-                            failed_late = r.failed_late,
-                            discrepancies = r.discrepancies,
-                            rpc_errors = r.rpc_errors,
-                            "G13: startup reconciliation complete"
-                        ),
+                        Ok(r) => {
+                            tracing::info!(
+                                checked = r.checked,
+                                filled_late = r.filled_late,
+                                failed_late = r.failed_late,
+                                discrepancies = r.discrepancies,
+                                rpc_errors = r.rpc_errors,
+                                released_usd = r.bet_dollars_to_release,
+                                "G13: startup reconciliation complete"
+                            );
+                            // F11: release exposure for positions that
+                            // transitioned to Failed in this reconcile pass.
+                            // record_open had booked exposure pessimistically
+                            // when the order was first submitted.
+                            if r.bet_dollars_to_release > 0.0 {
+                                risk_limits.release_exposure(r.bet_dollars_to_release);
+                            }
+                        }
                         Err(e) => tracing::warn!(error = %e,
                             "G13: reconciliation failed — continuing with local state"),
                     }
@@ -341,7 +351,9 @@ async fn main() -> anyhow::Result<()> {
                     client.clone(), positions.clone(), maint_cfg.clone(),
                 ));
                 tasks.spawn(execution::maintenance::periodic_reconcile_loop(
-                    client.clone(), positions.clone(), maint_cfg,
+                    client.clone(), positions.clone(),
+                    risk_limits.clone(),
+                    maint_cfg,
                 ));
 
                 // EDGE-A: Liquidity rewards quoter. Off by default — flip

@@ -400,6 +400,11 @@ mod tests {
     #[test]
     fn settle_50_positions_completes_quickly() {
         // Sanity: parallelism shouldn't introduce regressions on small loads.
+        // Threshold bumped from 200ms → 2000ms after F1/F2 added sync_data()
+        // to every JSONL write — durable writes cost ~10-30ms each on
+        // Windows NTFS, so 50 settles legitimately take ~1s. We're testing
+        // that parallelism still helps relative to sequential, not that
+        // fsync is fast.
         let dir = temp_dir();
         let store = PositionStore::open(&dir).unwrap();
         for i in 0..50 {
@@ -409,6 +414,8 @@ mod tests {
         let n = settle_positions_for_market(&store, "m", true).unwrap();
         let dt = start.elapsed();
         assert_eq!(n, 50);
-        assert!(dt.as_millis() < 200, "settle 50 should be fast, got {}ms", dt.as_millis());
+        assert!(dt.as_millis() < 2000,
+            "settle 50 should be fast (was 200ms pre-fsync), got {}ms",
+            dt.as_millis());
     }
 }

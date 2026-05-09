@@ -128,6 +128,7 @@ pub async fn cancel_stale_once(
 pub async fn periodic_reconcile_loop(
     client:    Arc<ClobClient>,
     positions: Arc<PositionStore>,
+    risk:      Arc<crate::risk::limits::RiskLimits>,
     cfg:       MaintenanceConfig,
 ) {
     let mut tick = interval(Duration::from_secs(cfg.reconcile_secs.max(60)));
@@ -147,8 +148,14 @@ pub async fn periodic_reconcile_loop(
                         filled_late = r.filled_late,
                         failed_late = r.failed_late,
                         discrepancies = r.discrepancies,
+                        released_usd = r.bet_dollars_to_release,
                         "periodic reconcile pass"
                     );
+                }
+                // F11: release exposure for newly-Failed positions so
+                // exposure doesn't leak permanently after every cancel.
+                if r.bet_dollars_to_release > 0.0 {
+                    risk.release_exposure(r.bet_dollars_to_release);
                 }
             }
             Err(e) => tracing::warn!(error = %e, "periodic reconcile failed"),

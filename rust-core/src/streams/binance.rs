@@ -106,13 +106,32 @@ pub async fn reconnect<F>(
 ) where
     F: FnMut(&str, &broadcast::Sender<StreamEvent>),
 {
+    // Minimum uptime for a clean close to be considered "healthy" enough
+    // to reset the backoff. Server-degraded clean closes (process crashed
+    // mid-frame, NAT idle drop) often arrive < 60s after connect; if we
+    // reset eagerly, we hammer the server with reconnects.
+    const HEALTHY_UPTIME: Duration = Duration::from_secs(60);
     let mut backoff = Duration::from_secs(BACKOFF_INIT_SECS);
     loop {
         tracing::info!(stream = label, "connecting");
+        let started = std::time::Instant::now();
         match run_connection(url, &subscribe_msg, &tx, &mut on_message).await {
             Ok(()) => {
-                tracing::warn!(stream = label, "closed cleanly, reconnecting");
-                backoff = Duration::from_secs(BACKOFF_INIT_SECS);
+                let uptime = started.elapsed();
+                if uptime >= HEALTHY_UPTIME {
+                    tracing::warn!(stream = label,
+                        uptime_secs = uptime.as_secs(),
+                        "closed cleanly after stable uptime, resetting backoff");
+                    backoff = Duration::from_secs(BACKOFF_INIT_SECS);
+                } else {
+                    tracing::warn!(stream = label,
+                        uptime_secs = uptime.as_secs(),
+                        retry_secs = backoff.as_secs(),
+                        "closed cleanly TOO SOON — treating as degraded; \
+                         keeping backoff to avoid reconnect spam");
+                    tokio::time::sleep(backoff).await;
+                    backoff = next_backoff(backoff, Duration::from_secs(BACKOFF_MAX_SECS));
+                }
             }
             Err(e) => {
                 tracing::error!(

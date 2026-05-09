@@ -77,10 +77,21 @@ pub async fn discover_btc_markets() -> Result<Vec<PolyMarket>> {
 
 /// Background task: refresh the shared market list every 5 minutes.
 /// Logs counts and the closest-to-resolving market on every tick.
+///
+/// On Gamma errors we keep the OLD list (fast path); but if we error
+/// CONSECUTIVELY for STALE_FAILURE_THRESHOLD ticks OR if every market
+/// in the cached list has close_time_ms in the past, we clear the list
+/// so the runner stops trying to trade against resolved markets.
 pub async fn market_discovery_loop(shared: Arc<RwLock<Vec<PolyMarket>>>) {
+    // After this many consecutive Gamma failures we assume the API is
+    // genuinely down (not a hiccup) and clear the cached list. At a
+    // 5-min poll interval this is 15 min of confirmed outage.
+    const STALE_FAILURE_THRESHOLD: u32 = 3;
+    let mut consecutive_failures: u32 = 0;
     loop {
         match discover_btc_markets().await {
             Ok(markets) => {
+                consecutive_failures = 0;
                 let n = markets.len();
                 let next_close = markets.iter().map(|m| m.close_time_ms).min();
                 {
@@ -94,7 +105,42 @@ pub async fn market_discovery_loop(shared: Arc<RwLock<Vec<PolyMarket>>>) {
                 );
             }
             Err(e) => {
-                tracing::error!(error = %e, "polymarket discovery failed");
+                consecutive_failures += 1;
+                tracing::error!(
+                    error = %e,
+                    consecutive_failures,
+                    "polymarket discovery failed"
+                );
+                if consecutive_failures >= STALE_FAILURE_THRESHOLD {
+                    // Clear the cached list so the runner halts on
+                    // empty markets rather than trading against a
+                    // potentially resolved snapshot. New signals on
+                    // primary_market_id will fall through harmlessly
+                    // (no market metadata → can't size or resolve).
+                    let mut w = shared.write().await;
+                    if !w.is_empty() {
+                        tracing::warn!(
+                            had = w.len(),
+                            "clearing stale market list after {} consecutive failures",
+                            consecutive_failures
+                        );
+                        w.clear();
+                    }
+                }
+            }
+        }
+        // Even on success, prune any markets whose close_time has
+        // passed — they shouldn't drive new signals. Cheap; runs once
+        // per 5-min tick.
+        let now_ms = chrono::Utc::now().timestamp_millis() as u64;
+        {
+            let mut w = shared.write().await;
+            let before = w.len();
+            w.retain(|m| m.close_time_ms > now_ms);
+            let after = w.len();
+            if before != after {
+                tracing::debug!(removed = before - after,
+                    "pruned closed markets from discovery snapshot");
             }
         }
         tokio::time::sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
@@ -338,6 +384,11 @@ pub async fn clob_stream(tx: broadcast::Sender<StreamEvent>, asset_ids: Vec<Stri
     }
 }
 
+// Read timeout for the CLOB book WebSocket. Half-open TCP (NAT idle,
+// server crashed without close frame) would otherwise hang read.next()
+// for hours waiting on OS keepalive. 60s matches poly_user.rs.
+const CLOB_READ_TIMEOUT: Duration = Duration::from_secs(60);
+
 async fn run_clob(subscribe_msg: &str, tx: &broadcast::Sender<StreamEvent>) -> Result<()> {
     let (ws, _) = connect_async(CLOB_WS_URL).await?;
     tracing::info!("clob connected");
@@ -346,8 +397,24 @@ async fn run_clob(subscribe_msg: &str, tx: &broadcast::Sender<StreamEvent>) -> R
         .send(Message::Text(subscribe_msg.to_string()))
         .await?;
 
-    while let Some(msg) = read.next().await {
-        match msg? {
+    loop {
+        // Wrap read.next() in a read timeout: half-open TCP would
+        // otherwise hang for hours. Treat timeout as connection lost.
+        let frame = match tokio::time::timeout(CLOB_READ_TIMEOUT, read.next()).await {
+            Ok(Some(frame)) => frame,
+            Ok(None) => {
+                tracing::warn!("clob server returned None — connection closed");
+                break;
+            }
+            Err(_) => {
+                tracing::warn!(
+                    timeout_secs = CLOB_READ_TIMEOUT.as_secs(),
+                    "clob book read timeout — assuming half-open, reconnecting"
+                );
+                break;
+            }
+        };
+        match frame? {
             Message::Text(text) => {
                 if text.trim().is_empty() {
                     continue; // CLOB occasionally sends empty keepalives
