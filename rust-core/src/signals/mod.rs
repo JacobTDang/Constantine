@@ -1,10 +1,16 @@
 pub mod event_arb;
 pub mod hibernating;
 pub mod intramarket;
+pub mod news_reaction;
 pub mod oracle_arb;
 pub mod player_props;
 pub mod regime;
+pub mod resolution_decay;
 pub mod sportsbook_devig;
+pub mod stat_arb;
+pub mod twitter_truth_social;
+pub mod uma_dispute;
+pub mod whale_fade;
 pub mod whale_follow;
 
 use std::sync::Arc;
@@ -21,7 +27,7 @@ use oracle_arb::{check_oracle_arb, OracleArbSignal};
 use regime::{classify_regime, Regime};
 
 /// Direction of a trade signal — which side of a binary market to buy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum Direction {
     /// Buy the "Up" (YES) token — bet that BTC closes higher than the strike
     Up,
