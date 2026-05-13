@@ -32,6 +32,9 @@ data/research/
 data/whale_wallets.json
 data/.whale_seen.json
 
+# MCP config contains personal access tokens — never commit
+.mcp.json
+
 # IDE / tools
 .vscode/
 .idea/
@@ -58,3 +61,4 @@ GAPS.md
 READINESS.md
 REVIEW.md
 STRATEGIES.md
+research/
