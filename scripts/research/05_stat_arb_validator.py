@@ -42,7 +42,7 @@ import requests
 GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events"
 CLOB_HISTORY_URL = "https://clob.polymarket.com/prices-history"
 
-LOOKBACK_DAYS         = 60
+LOOKBACK_DAYS         = 14       # CLOB prices-history caps at ~14d windows
 MIN_HISTORY_POINTS    = 30
 PAGE_SIZE             = 100
 MAX_GAMMA_PAGES       = 3
@@ -138,9 +138,9 @@ def fetch_markets() -> list[dict]:
 def fetch_history(token_id: str) -> list[tuple[datetime, float]]:
     end_ts = int(datetime.now(timezone.utc).timestamp())
     start_ts = end_ts - LOOKBACK_DAYS * 86400
+    # interval + startTs/endTs is mutually exclusive on this endpoint
     params = {
         "market":   token_id,
-        "interval": "1h",
         "startTs":  str(start_ts),
         "endTs":    str(end_ts),
         "fidelity": "60",

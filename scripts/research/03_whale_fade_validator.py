@@ -49,7 +49,10 @@ import requests
 
 DATA_API_BASE       = "https://data-api.polymarket.com"
 DATA_API_TRADES     = f"{DATA_API_BASE}/trades"
-DATA_API_LEADERS    = f"{DATA_API_BASE}/leaderboard"  # falls back to /v1/leaderboard
+# The legacy data-api/leaderboard endpoint returns 404 as of 2026-05.
+# The actual leaderboard lives at the lb-api subdomain.
+LB_API_VOLUME       = "https://lb-api.polymarket.com/volume"
+LB_API_PROFIT       = "https://lb-api.polymarket.com/profit"
 GAMMA_MARKETS_URL   = "https://gamma-api.polymarket.com/markets"
 
 # ── Cohort filters (from research/strategies/03_whale_fade.md) ──────────────
@@ -143,54 +146,74 @@ def _normalise_leaders(payload) -> list[dict]:
 
 
 def fetch_leaderboard() -> list[LeaderEntry]:
-    """Fetch a few pages from the public leaderboard endpoint, trying
-    the two known URL shapes. Empty list on failure."""
-    out: list[LeaderEntry] = []
-    for base_url in (DATA_API_LEADERS, f"{DATA_API_BASE}/v1/leaderboard"):
-        for page in range(LEADERBOARD_PAGES):
-            params = {
-                "limit":  str(LEADERBOARD_PAGE_SIZE),
-                "offset": str(page * LEADERBOARD_PAGE_SIZE),
-                "period": "ALL",
-                "order":  "volume",
-            }
+    """Fetch top-volume traders from the lb-api endpoint and merge in
+    their corresponding profit numbers (so we can filter to losers).
+    Returns LeaderEntry rows with vol_usd populated; pnl_usd populated
+    when the wallet appears on the profit leaderboard, else 0.0 with a
+    note that we'll need to compute it from trades."""
+    # 1. Top-volume traders
+    try:
+        r = requests.get(LB_API_VOLUME, params={"window": "all", "limit": 200}, timeout=15)
+        r.raise_for_status()
+        vol_rows = r.json()
+    except (requests.RequestException, ValueError) as exc:
+        print(f"  leaderboard volume error: {exc}", file=sys.stderr)
+        vol_rows = []
+    # 2. Top-profit traders (mostly the WINNERS; their absence below this
+    # cutoff means the wallet is likely a loser or break-even)
+    try:
+        r2 = requests.get(LB_API_PROFIT, params={"window": "all", "limit": 500}, timeout=15)
+        r2.raise_for_status()
+        profit_rows = r2.json()
+    except (requests.RequestException, ValueError) as exc:
+        print(f"  leaderboard profit error: {exc}", file=sys.stderr)
+        profit_rows = []
+
+    profit_by_wallet: dict[str, float] = {}
+    for p in profit_rows:
+        w = (p.get("proxyWallet") or "").lower()
+        if w:
             try:
-                r = requests.get(base_url, params=params, timeout=15)
-                r.raise_for_status()
-                entries = _normalise_leaders(r.json())
-            except (requests.RequestException, ValueError) as exc:
-                print(f"  leaderboard error ({base_url} page={page}): {exc}", file=sys.stderr)
-                break
-            if not entries:
-                break
-            for e in entries:
-                wallet = (e.get("proxyWallet") or e.get("address")
-                          or e.get("wallet") or "").lower()
-                if not wallet:
-                    continue
-                try:
-                    pnl = float(e.get("pnl") or e.get("profit") or 0)
-                    vol = float(e.get("volume") or e.get("vol") or 0)
-                    trades = int(e.get("trades") or e.get("trade_count") or 0)
-                except (TypeError, ValueError):
-                    continue
-                out.append(LeaderEntry(wallet=wallet, pnl_usd=pnl,
-                                       vol_usd=vol, trades=trades))
-            time.sleep(SLEEP_BETWEEN_REQS)
-        if out:
-            break
-    print(f"fetched {len(out)} leaderboard entries")
+                profit_by_wallet[w] = float(p.get("amount", 0))
+            except (TypeError, ValueError):
+                pass
+
+    out: list[LeaderEntry] = []
+    for v in vol_rows:
+        w = (v.get("proxyWallet") or "").lower()
+        if not w:
+            continue
+        try:
+            vol = float(v.get("amount", 0))
+        except (TypeError, ValueError):
+            continue
+        # If wallet is on the profit top-500, use that pnl. Otherwise, mark
+        # pnl as 0.0 — they'll get the proper compute treatment below.
+        pnl = profit_by_wallet.get(w, 0.0)
+        # If NOT on the profit top-500 and vol is high, that wallet is
+        # statistically likely to be a loser (since top-profit ranking is
+        # well-funded). Mark pnl as -1.0 sentinel for "presumed loser".
+        # 0.0 = unknown / could be small either way.
+        if pnl == 0.0 and vol >= COHORT_MIN_VOLUME_USD and w not in profit_by_wallet:
+            pnl = -1.0   # presumed-loser sentinel
+        out.append(LeaderEntry(wallet=w, pnl_usd=pnl, vol_usd=vol, trades=0))
+
+    print(f"fetched {len(out)} leaderboard entries "
+          f"(profit map: {len(profit_by_wallet)} winners known)")
     return out
 
 
 def loser_cohort(leaders: list[LeaderEntry]) -> list[LeaderEntry]:
+    """Filter to wallets that are HIGH VOLUME and NOT on the top-profit list
+    (presumed-loser sentinel pnl=-1.0). The Phase 1 sidecar will replace
+    this with a proper per-wallet realized-pnl computation."""
     out: list[LeaderEntry] = []
     for entry in leaders:
         if entry.vol_usd < COHORT_MIN_VOLUME_USD:
             continue
-        if entry.pnl_usd > COHORT_MAX_PNL_USD:
-            continue
-        if entry.trades and entry.trades < COHORT_MIN_TRADES:
+        # Either confirmed loser (pnl <= cohort cap) OR presumed loser
+        # (high vol but absent from top-profit leaderboard)
+        if entry.pnl_usd > COHORT_MAX_PNL_USD and entry.pnl_usd > -0.5:
             continue
         out.append(entry)
     return out

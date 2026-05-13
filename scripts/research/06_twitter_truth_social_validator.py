@@ -61,7 +61,7 @@ CLOB_HISTORY_URL   = "https://clob.polymarket.com/prices-history"
 
 # ── Parameters ──────────────────────────────────────────────────────────────
 
-LOOKBACK_DAYS         = 30
+LOOKBACK_DAYS         = 14       # CLOB prices-history caps at ~14d windows
 MAX_POSTS             = 60
 PRE_WINDOW_HOURS      = 1
 POST_WINDOW_HOURS     = 2
@@ -282,9 +282,9 @@ def fetch_price_history(token_id: str, around_ts: datetime,
                         hours_back: int, hours_forward: int) -> list[tuple[datetime, float]]:
     start_ts = int((around_ts - timedelta(hours=hours_back)).timestamp())
     end_ts   = int((around_ts + timedelta(hours=hours_forward)).timestamp())
+    # interval + startTs/endTs is mutually exclusive on this endpoint
     params = {
         "market":   token_id,
-        "interval": "1h",
         "startTs":  str(start_ts),
         "endTs":    str(end_ts),
         "fidelity": "60",

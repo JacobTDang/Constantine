@@ -55,8 +55,10 @@ CONTINUATION_PP = 1.0            # >=1pp same-direction follow-through = continu
 MIN_PRICE = 0.05                 # ignore markets pinned below 5c (no meaningful drift)
 MAX_PRICE = 0.95                 # ignore markets pinned above 95c
 
-# Market filters
-LOOKBACK_DAYS = 60               # pull markets resolved in last N days
+# Market filters. Polymarket's CLOB prices-history API caps explicit
+# startTs/endTs windows at ~14 days; longer windows return 400. Stay
+# inside the cap and accept the shorter empirical horizon.
+LOOKBACK_DAYS = 14
 MAX_EVENTS = 80                  # cap to keep runtime under 5 min
 SLEEP_BETWEEN_REQS = 0.4         # be polite to gamma + clob
 PAGE_SIZE = 200
@@ -200,12 +202,14 @@ def fetch_price_history(token_id: str) -> list[tuple[datetime, float]]:
     list of (timestamp, price) sorted ascending. Empty list on failure."""
     end_ts = int(datetime.now(timezone.utc).timestamp())
     start_ts = end_ts - (LOOKBACK_DAYS * 86400)
+    # NOTE: Polymarket CLOB prices-history accepts EITHER `interval=<bucket>`
+    # OR `startTs+endTs+fidelity` — passing both returns an empty history.
+    # `fidelity` is minutes-per-bucket; 60 = 1h buckets.
     params = {
-        "market":  token_id,
-        "interval": "1h",   # gamma's prices-history finest cheap interval
-        "startTs": str(start_ts),
-        "endTs":   str(end_ts),
-        "fidelity": "60",   # 60-minute bucket; matches "1h"
+        "market":   token_id,
+        "startTs":  str(start_ts),
+        "endTs":    str(end_ts),
+        "fidelity": "60",
     }
     try:
         r = requests.get(CLOB_HISTORY_URL, params=params, timeout=20)
