@@ -63,6 +63,42 @@ pub struct Config {
     pub hibernating_enabled:  bool,
     pub hibernating_scan_secs: u64,
 
+    // Strategy 01: news-event reaction pipeline. Default OFF — needs EU VPS
+    // and a configured news sidecar to be safely enabled.
+    pub news_reaction_enabled:        bool,
+    pub news_reaction_path:           String,
+    pub news_reaction_reload_secs:    u64,
+
+    // Strategy 03: whale-fade (loser cohort). Default OFF — needs the
+    // cohort-builder sidecar and recent loser-trade JSONL.
+    pub whale_fade_enabled:           bool,
+    pub whale_fade_trades_path:       String,
+    pub whale_fade_reload_secs:       u64,
+
+    // Strategy 06: Twitter / Truth Social overlay. Default OFF — needs
+    // TwitterAPI.io subscription + Truth Social relay droplet.
+    pub twitter_truth_social_enabled: bool,
+    pub twitter_truth_social_path:    String,
+    pub twitter_truth_social_reload_secs: u64,
+
+    // Strategy 05: cross-market statistical arbitrage. Default OFF —
+    // needs the daily pair-universe builder + spread monitor.
+    pub stat_arb_enabled:             bool,
+    pub stat_arb_pairs_path:          String,
+    pub stat_arb_reload_secs:         u64,
+
+    // Strategy 02: resolution-proximity decay. Default OFF — needs the
+    // per-source truth-adapter library to gate entries.
+    pub resolution_decay_enabled:     bool,
+    pub resolution_decay_path:        String,
+    pub resolution_decay_reload_secs: u64,
+
+    // Strategy 07: UMA dispute + LLM gate. Default OFF — needs the UMA
+    // subgraph listener and an LLM API key with web search.
+    pub uma_dispute_enabled:          bool,
+    pub uma_dispute_path:             String,
+    pub uma_dispute_reload_secs:      u64,
+
     // Logging
     pub log_level: String,
 }
@@ -158,6 +194,37 @@ impl Config {
             whale_reload_secs:        u64_var("WHALE_RELOAD_SECS", 30)?,
             hibernating_enabled:      bool_var("HIBERNATING_ENABLED", false)?,
             hibernating_scan_secs:    u64_var("HIBERNATING_SCAN_SECS", 1800)?,
+
+            news_reaction_enabled:        bool_var("NEWS_REACTION_ENABLED", false)?,
+            news_reaction_path:           get("NEWS_REACTION_PATH")
+                .unwrap_or_else(|| "data/news_classifications.jsonl".to_string()),
+            news_reaction_reload_secs:    u64_var("NEWS_REACTION_RELOAD_SECS", 5)?,
+
+            whale_fade_enabled:           bool_var("WHALE_FADE_ENABLED", false)?,
+            whale_fade_trades_path:       get("WHALE_FADE_TRADES_PATH")
+                .unwrap_or_else(|| "data/whale_fade_trades.jsonl".to_string()),
+            whale_fade_reload_secs:       u64_var("WHALE_FADE_RELOAD_SECS", 30)?,
+
+            twitter_truth_social_enabled: bool_var("TWITTER_TRUTH_SOCIAL_ENABLED", false)?,
+            twitter_truth_social_path:    get("TWITTER_TRUTH_SOCIAL_PATH")
+                .unwrap_or_else(|| "data/twitter_truth_social_posts.jsonl".to_string()),
+            twitter_truth_social_reload_secs: u64_var("TWITTER_TRUTH_SOCIAL_RELOAD_SECS", 5)?,
+
+            stat_arb_enabled:             bool_var("STAT_ARB_ENABLED", false)?,
+            stat_arb_pairs_path:          get("STAT_ARB_PAIRS_PATH")
+                .unwrap_or_else(|| "data/stat_arb_pairs.json".to_string()),
+            stat_arb_reload_secs:         u64_var("STAT_ARB_RELOAD_SECS", 60)?,
+
+            resolution_decay_enabled:     bool_var("RESOLUTION_DECAY_ENABLED", false)?,
+            resolution_decay_path:        get("RESOLUTION_DECAY_PATH")
+                .unwrap_or_else(|| "data/resolution_decay_candidates.jsonl".to_string()),
+            resolution_decay_reload_secs: u64_var("RESOLUTION_DECAY_RELOAD_SECS", 60)?,
+
+            uma_dispute_enabled:          bool_var("UMA_DISPUTE_ENABLED", false)?,
+            uma_dispute_path:             get("UMA_DISPUTE_PATH")
+                .unwrap_or_else(|| "data/uma_disputes.jsonl".to_string()),
+            uma_dispute_reload_secs:      u64_var("UMA_DISPUTE_RELOAD_SECS", 60)?,
+
             log_level:                get("LOG_LEVEL").unwrap_or_else(|| "info".to_string()),
         })
     }

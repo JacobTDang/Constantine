@@ -83,18 +83,30 @@ pub enum Strategy {
     LpRewards,        // EDGE-A: liquidity rewards market making
     SportsbookDevig,  // EDGE-C: Pinnacle no-vig overlay
     WhaleFollow,      // EDGE-D: Polymarket whale-follow
+    NewsReaction,     // Strategy 01: news-event reaction pipeline
+    WhaleFade,        // Strategy 03: loser-cohort whale-fade
+    TwitterTruthSocial, // Strategy 06: Twitter / Truth Social overlay
+    StatArb,          // Strategy 05: cross-market correlated baskets
+    ResolutionDecay,  // Strategy 02: resolution-proximity decay
+    UmaDispute,       // Strategy 07: UMA dispute + LLM gate
 }
 
 /// Per-strategy gates so a bug in one strategy doesn't halt the others.
 /// Each one is independent — manual reset only.
 #[derive(Debug, Default)]
 pub struct StrategyKills {
-    pub oracle:           AtomicBool,
-    pub player_props:     AtomicBool,
-    pub event_arb:        AtomicBool,
-    pub lp_rewards:       AtomicBool,
-    pub sportsbook_devig: AtomicBool,
-    pub whale_follow:     AtomicBool,
+    pub oracle:               AtomicBool,
+    pub player_props:         AtomicBool,
+    pub event_arb:            AtomicBool,
+    pub lp_rewards:           AtomicBool,
+    pub sportsbook_devig:     AtomicBool,
+    pub whale_follow:         AtomicBool,
+    pub news_reaction:        AtomicBool,
+    pub whale_fade:           AtomicBool,
+    pub twitter_truth_social: AtomicBool,
+    pub stat_arb:             AtomicBool,
+    pub resolution_decay:     AtomicBool,
+    pub uma_dispute:          AtomicBool,
 }
 
 #[derive(Debug)]
@@ -353,34 +365,52 @@ impl RiskLimits {
     /// trading. Manual reset only.
     pub fn kill_strategy(&self, strategy: Strategy) {
         match strategy {
-            Strategy::Oracle          => self.strategy.oracle.store(true, Ordering::SeqCst),
-            Strategy::PlayerProps     => self.strategy.player_props.store(true, Ordering::SeqCst),
-            Strategy::EventArb        => self.strategy.event_arb.store(true, Ordering::SeqCst),
-            Strategy::LpRewards       => self.strategy.lp_rewards.store(true, Ordering::SeqCst),
-            Strategy::SportsbookDevig => self.strategy.sportsbook_devig.store(true, Ordering::SeqCst),
-            Strategy::WhaleFollow     => self.strategy.whale_follow.store(true, Ordering::SeqCst),
+            Strategy::Oracle             => self.strategy.oracle.store(true, Ordering::SeqCst),
+            Strategy::PlayerProps        => self.strategy.player_props.store(true, Ordering::SeqCst),
+            Strategy::EventArb           => self.strategy.event_arb.store(true, Ordering::SeqCst),
+            Strategy::LpRewards          => self.strategy.lp_rewards.store(true, Ordering::SeqCst),
+            Strategy::SportsbookDevig    => self.strategy.sportsbook_devig.store(true, Ordering::SeqCst),
+            Strategy::WhaleFollow        => self.strategy.whale_follow.store(true, Ordering::SeqCst),
+            Strategy::NewsReaction       => self.strategy.news_reaction.store(true, Ordering::SeqCst),
+            Strategy::WhaleFade          => self.strategy.whale_fade.store(true, Ordering::SeqCst),
+            Strategy::TwitterTruthSocial => self.strategy.twitter_truth_social.store(true, Ordering::SeqCst),
+            Strategy::StatArb            => self.strategy.stat_arb.store(true, Ordering::SeqCst),
+            Strategy::ResolutionDecay    => self.strategy.resolution_decay.store(true, Ordering::SeqCst),
+            Strategy::UmaDispute         => self.strategy.uma_dispute.store(true, Ordering::SeqCst),
         }
     }
 
     pub fn reset_strategy(&self, strategy: Strategy) {
         match strategy {
-            Strategy::Oracle          => self.strategy.oracle.store(false, Ordering::SeqCst),
-            Strategy::PlayerProps     => self.strategy.player_props.store(false, Ordering::SeqCst),
-            Strategy::EventArb        => self.strategy.event_arb.store(false, Ordering::SeqCst),
-            Strategy::LpRewards       => self.strategy.lp_rewards.store(false, Ordering::SeqCst),
-            Strategy::SportsbookDevig => self.strategy.sportsbook_devig.store(false, Ordering::SeqCst),
-            Strategy::WhaleFollow     => self.strategy.whale_follow.store(false, Ordering::SeqCst),
+            Strategy::Oracle             => self.strategy.oracle.store(false, Ordering::SeqCst),
+            Strategy::PlayerProps        => self.strategy.player_props.store(false, Ordering::SeqCst),
+            Strategy::EventArb           => self.strategy.event_arb.store(false, Ordering::SeqCst),
+            Strategy::LpRewards          => self.strategy.lp_rewards.store(false, Ordering::SeqCst),
+            Strategy::SportsbookDevig    => self.strategy.sportsbook_devig.store(false, Ordering::SeqCst),
+            Strategy::WhaleFollow        => self.strategy.whale_follow.store(false, Ordering::SeqCst),
+            Strategy::NewsReaction       => self.strategy.news_reaction.store(false, Ordering::SeqCst),
+            Strategy::WhaleFade          => self.strategy.whale_fade.store(false, Ordering::SeqCst),
+            Strategy::TwitterTruthSocial => self.strategy.twitter_truth_social.store(false, Ordering::SeqCst),
+            Strategy::StatArb            => self.strategy.stat_arb.store(false, Ordering::SeqCst),
+            Strategy::ResolutionDecay    => self.strategy.resolution_decay.store(false, Ordering::SeqCst),
+            Strategy::UmaDispute         => self.strategy.uma_dispute.store(false, Ordering::SeqCst),
         }
     }
 
     pub fn is_strategy_killed(&self, strategy: Strategy) -> bool {
         match strategy {
-            Strategy::Oracle          => self.strategy.oracle.load(Ordering::SeqCst),
-            Strategy::PlayerProps     => self.strategy.player_props.load(Ordering::SeqCst),
-            Strategy::EventArb        => self.strategy.event_arb.load(Ordering::SeqCst),
-            Strategy::LpRewards       => self.strategy.lp_rewards.load(Ordering::SeqCst),
-            Strategy::SportsbookDevig => self.strategy.sportsbook_devig.load(Ordering::SeqCst),
-            Strategy::WhaleFollow     => self.strategy.whale_follow.load(Ordering::SeqCst),
+            Strategy::Oracle             => self.strategy.oracle.load(Ordering::SeqCst),
+            Strategy::PlayerProps        => self.strategy.player_props.load(Ordering::SeqCst),
+            Strategy::EventArb           => self.strategy.event_arb.load(Ordering::SeqCst),
+            Strategy::LpRewards          => self.strategy.lp_rewards.load(Ordering::SeqCst),
+            Strategy::SportsbookDevig    => self.strategy.sportsbook_devig.load(Ordering::SeqCst),
+            Strategy::WhaleFollow        => self.strategy.whale_follow.load(Ordering::SeqCst),
+            Strategy::NewsReaction       => self.strategy.news_reaction.load(Ordering::SeqCst),
+            Strategy::WhaleFade          => self.strategy.whale_fade.load(Ordering::SeqCst),
+            Strategy::TwitterTruthSocial => self.strategy.twitter_truth_social.load(Ordering::SeqCst),
+            Strategy::StatArb            => self.strategy.stat_arb.load(Ordering::SeqCst),
+            Strategy::ResolutionDecay    => self.strategy.resolution_decay.load(Ordering::SeqCst),
+            Strategy::UmaDispute         => self.strategy.uma_dispute.load(Ordering::SeqCst),
         }
     }
 
