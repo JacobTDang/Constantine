@@ -51,15 +51,15 @@ import requests
 GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events"
 CLOB_HISTORY_URL = "https://clob.polymarket.com/prices-history"
 
-LOOKBACK_DAYS         = 14       # CLOB prices-history caps at ~14d windows
+LOOKBACK_DAYS         = 60       # post-filter (we use interval=max now)
 PAGE_SIZE             = 100
-MAX_GAMMA_PAGES       = 6
-MAX_MARKETS           = 200
+MAX_GAMMA_PAGES       = 12       # scan more pages to find markets with history
+MAX_MARKETS           = 600      # 3x the prior cap; most closed markets have 0 history
 PRE_HOURS             = 4
 MIN_ENTRY_PRICE       = 0.50            # below this would be a long-shot
 MAX_ENTRY_PRICE       = 0.97            # above this leaves no spread
 HARD_RUNTIME_SECS     = 270
-SLEEP_BETWEEN_REQS    = 0.35
+SLEEP_BETWEEN_REQS    = 0.30
 
 FEE_TAKER = 0.02
 
@@ -162,15 +162,19 @@ def first_token_id(m: dict) -> str | None:
 
 
 def fetch_price_window(token_id: str, around: datetime) -> list[tuple[datetime, float]]:
-    start_ts = int((around - timedelta(hours=PRE_HOURS + 2)).timestamp())
-    end_ts = int((around + timedelta(hours=1)).timestamp())
-    # interval + startTs/endTs is mutually exclusive on this endpoint
-    params = {
-        "market":   token_id,
-        "startTs":  str(start_ts),
-        "endTs":    str(end_ts),
-        "fidelity": "60",
-    }
+    """Return the market's full known history. We can't query the
+    [T-4h, T+1h] window directly because Polymarket's CLOB
+    prices-history with explicit startTs+endTs:
+      (a) is mutually exclusive with `interval`, and
+      (b) returns 0 points for narrow windows on long-closed markets
+          (the endpoint appears to only return data from active book
+          activity, which is absent post-resolution).
+    The `interval=max` form bypasses both issues and returns every
+    bucket the indexer has on file. Caller seeks T-4h via
+    `price_at_or_before`. The `around` argument is unused but kept
+    for signature compatibility."""
+    del around  # silence linter; signature preserved for caller
+    params = {"market": token_id, "interval": "max"}
     try:
         r = requests.get(CLOB_HISTORY_URL, params=params, timeout=15)
         r.raise_for_status()

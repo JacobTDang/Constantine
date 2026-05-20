@@ -66,9 +66,14 @@ LEADERBOARD_PAGE_SIZE     = 100
 
 # ── Sampling parameters ─────────────────────────────────────────────────────
 
-LOOKBACK_DAYS             = 60
-COHORT_SETTLED_GAP_DAYS   = 7           # exclude trades within last N days (avoid look-ahead)
-MAX_TRADES_PER_WALLET     = 200
+# The data-api/trades endpoint returns the wallet's most-recent N trades
+# regardless of date. We need trades on markets that have since RESOLVED,
+# which means looking back far enough that markets had time to close.
+# Most political/sports markets resolve within 30-90 days; 180-day
+# lookback catches enough resolved-market trades per cohort wallet.
+LOOKBACK_DAYS             = 180
+COHORT_SETTLED_GAP_DAYS   = 3           # exclude trades within last N days (avoid look-ahead)
+MAX_TRADES_PER_WALLET     = 500
 MIN_FADE_SIZE_USD         = 50.0
 MAX_FADE_SIZE_USD         = 5_000.0
 HARD_RUNTIME_CAP_SECS     = 270         # 4.5 min
@@ -287,47 +292,58 @@ def lookup_market_resolution(condition_id: str) -> bool | None:
 
 def evaluate_wallet_fades(wallet: str, raw_trades: list[dict],
                            lookback_start_ts_ms: int,
-                           lookahead_cutoff_ms: int) -> list[FadeOutcome]:
+                           lookahead_cutoff_ms: int,
+                           skip_counts: dict[str, int] | None = None) -> list[FadeOutcome]:
     """For each BUY in the wallet's history within lookback, simulate
-    a fade and compute realized P&L based on market resolution."""
+    a fade and compute realized P&L based on market resolution.
+    Increments `skip_counts` per skip reason (for diagnostics)."""
+    sc = skip_counts if skip_counts is not None else {}
+    def bump(k: str) -> None:
+        sc[k] = sc.get(k, 0) + 1
     out: list[FadeOutcome] = []
     for t in raw_trades:
         side = (t.get("side") or "").upper()
         if side != "BUY":
-            continue
-        # outcomeIndex 0 = YES side, 1 = NO side. We define the "whale buy
-        # price" as the price on whichever side they bought; the fade
-        # entry is on the OTHER side.
+            bump("not_buy"); continue
+        # outcomeIndex 0 = YES side, 1 = NO side. data-api/trades populates
+        # this field reliably for cohort wallets (verified on lb-api top
+        # wallets); we don't need an inference fallback.
         try:
             idx = int(t.get("outcomeIndex", -1))
         except (TypeError, ValueError):
-            continue
+            bump("bad_outcome_index"); continue
         if idx not in (0, 1):
-            continue
+            bump("bad_outcome_index"); continue
         try:
             price = float(t.get("price") or 0)
             shares = float(t.get("size") or t.get("amount") or 0)
         except (TypeError, ValueError):
-            continue
-        if price <= 0.01 or price >= 0.99 or shares <= 0:
-            continue
+            bump("bad_price_or_size"); continue
+        # Mirror the live strategy's fade band [0.20, 0.80] from
+        # rust-core/src/signals/whale_fade.rs (FADE_MIN_PRICE /
+        # FADE_MAX_PRICE). Anything outside this band the live
+        # signal wouldn't fade, so the backtest shouldn't either.
+        if price < 0.20 or price > 0.80 or shares <= 0:
+            bump("price_or_size_out_of_band"); continue
         size_usd = price * shares
         if size_usd < MIN_FADE_SIZE_USD or size_usd > MAX_FADE_SIZE_USD:
-            continue
+            bump("size_out_of_band"); continue
 
         ts_raw = t.get("timestamp") or t.get("matchTime") or t.get("ts")
         try:
             ts = int(ts_raw)
             ts_ms = ts * 1000 if ts < 10**12 else ts
         except (TypeError, ValueError):
-            continue
-        if ts_ms < lookback_start_ts_ms or ts_ms > lookahead_cutoff_ms:
-            continue
+            bump("bad_ts"); continue
+        if ts_ms < lookback_start_ts_ms:
+            bump("ts_too_old"); continue
+        if ts_ms > lookahead_cutoff_ms:
+            bump("ts_too_recent"); continue
 
         condition_id = (t.get("conditionId") or t.get("market_id") or "")
         yes_won = lookup_market_resolution(condition_id)
         if yes_won is None:
-            continue
+            bump("market_not_resolved"); continue
 
         # whale bought outcome `idx` at `price`. Fade = we buy opposite at
         # (1 - price + tick). Our payoff = $1 if opposite won, else $0.
@@ -392,6 +408,7 @@ def main() -> int:
     # exclude last COHORT_SETTLED_GAP_DAYS to avoid the recent streak that
     # qualified them now being the same streak we'd "fade"
     cutoff_ms = now_ms - COHORT_SETTLED_GAP_DAYS * 86400 * 1000
+    skip_counts: dict[str, int] = {}
 
     for i, entry in enumerate(cohort):
         if time.time() - started > HARD_RUNTIME_CAP_SECS:
@@ -419,7 +436,8 @@ def main() -> int:
             continue
 
         fades = evaluate_wallet_fades(entry.wallet, raw_trades,
-                                       lookback_start_ms, cutoff_ms)
+                                       lookback_start_ms, cutoff_ms,
+                                       skip_counts=skip_counts)
         res.n_wallets_processed += 1
         for f in fades:
             res.n_fades_evaluated += 1
@@ -470,6 +488,10 @@ def main() -> int:
     print(f"Leaderboard entries:     {res.n_leaders_scanned}")
     print(f"Loser cohort:            {res.n_cohort}")
     print(f"Wallets w/ trades:       {res.n_wallets_processed}")
+    if skip_counts:
+        print(f"Skip reasons (per trade):")
+        for reason, count in sorted(skip_counts.items(), key=lambda kv: -kv[1]):
+            print(f"  {reason:30} {count}")
     print(f"Fades evaluated:         {res.n_fades_evaluated}")
     print(f"Hit rate:                {res.hit_rate*100:.1f}%")
     print(f"Avg fade edge:           {res.avg_edge_pct:+.2f}% per trade")

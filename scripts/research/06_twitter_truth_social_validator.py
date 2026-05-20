@@ -61,7 +61,7 @@ CLOB_HISTORY_URL   = "https://clob.polymarket.com/prices-history"
 
 # ── Parameters ──────────────────────────────────────────────────────────────
 
-LOOKBACK_DAYS         = 14       # CLOB prices-history caps at ~14d windows
+LOOKBACK_DAYS         = 30       # widen since we use interval=max (no API cap)
 MAX_POSTS             = 60
 PRE_WINDOW_HOURS      = 1
 POST_WINDOW_HOURS     = 2
@@ -72,7 +72,9 @@ PAGE_SIZE             = 100
 MAX_GAMMA_PAGES       = 4
 MAX_MARKETS_PER_POST  = 10        # cap price-history fetches per post
 
-CATEGORY_TAGS         = ("politics", "trump", "world", "geopolitics")
+# Narrow tags + only consider markets that pre-existed the lookback
+# AND extend past it, so each post has history on both sides.
+CATEGORY_TAGS         = ("politics", "elections")
 
 USER_AGENT = "Mozilla/5.0 (Constantine validator; +https://github.com/)"
 
@@ -280,15 +282,12 @@ def fetch_political_markets() -> list[dict]:
 
 def fetch_price_history(token_id: str, around_ts: datetime,
                         hours_back: int, hours_forward: int) -> list[tuple[datetime, float]]:
-    start_ts = int((around_ts - timedelta(hours=hours_back)).timestamp())
-    end_ts   = int((around_ts + timedelta(hours=hours_forward)).timestamp())
-    # interval + startTs/endTs is mutually exclusive on this endpoint
-    params = {
-        "market":   token_id,
-        "startTs":  str(start_ts),
-        "endTs":    str(end_ts),
-        "fidelity": "60",
-    }
+    """Use interval=max — the only form that returns reliable history
+    for long-lived markets. Caller filters to the desired window after
+    receiving the full series. (around_ts/hours_back/hours_forward are
+    kept on the signature for upstream caller compatibility.)"""
+    del around_ts, hours_back, hours_forward  # silence linter
+    params = {"market": token_id, "interval": "max"}
     try:
         r = requests.get(CLOB_HISTORY_URL, params=params, timeout=15)
         r.raise_for_status()
@@ -379,14 +378,20 @@ def main() -> int:
         print("[RED] KILL: no political markets returned from Gamma API.")
         return 3
 
-    # Pre-filter to markets that have token ids
+    # Pre-filter to markets that have token ids and a parseable endDate
     candidate_markets = []
     for m in markets:
         tid = first_token_id(m)
-        if tid:
-            m["_tid"] = tid
-            candidate_markets.append(m)
-    print(f"using {len(candidate_markets)} markets with valid token ids")
+        if not tid:
+            continue
+        end_raw = m.get("endDate", "")
+        try:
+            m["_end_dt"] = datetime.fromisoformat(end_raw.replace("Z", "+00:00"))
+        except (TypeError, AttributeError, ValueError):
+            continue
+        m["_tid"] = tid
+        candidate_markets.append(m)
+    print(f"using {len(candidate_markets)} markets with valid token ids + endDate")
 
     res = ValidationResult()
     res.n_posts_parsed = len(posts)
@@ -401,10 +406,19 @@ def main() -> int:
             print(f"  runtime cap hit at post {i}/{len(posts)}", file=sys.stderr)
             break
 
+        # Per-post candidate filter: market must extend past post time by
+        # the post-window, so we have data on both sides of the post.
+        post_eligible = [
+            m for m in candidate_markets
+            if m["_end_dt"] > post.ts_utc + timedelta(hours=POST_WINDOW_HOURS + 1)
+        ]
+        if not post_eligible:
+            continue
+
         # Sample N markets that were active around the post time
         sample = rng.sample(
-            candidate_markets,
-            min(MAX_MARKETS_PER_POST, len(candidate_markets)),
+            post_eligible,
+            min(MAX_MARKETS_PER_POST, len(post_eligible)),
         )
         had_any = False
         for m in sample:

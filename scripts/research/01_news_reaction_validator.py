@@ -55,17 +55,21 @@ CONTINUATION_PP = 1.0            # >=1pp same-direction follow-through = continu
 MIN_PRICE = 0.05                 # ignore markets pinned below 5c (no meaningful drift)
 MAX_PRICE = 0.95                 # ignore markets pinned above 95c
 
-# Market filters. Polymarket's CLOB prices-history API caps explicit
-# startTs/endTs windows at ~14 days; longer windows return 400. Stay
-# inside the cap and accept the shorter empirical horizon.
-LOOKBACK_DAYS = 14
+# Market filters. We use `interval=max` against the CLOB prices-history
+# endpoint (the only interval value that reliably returns the full
+# history for resolved/long-lived markets). Lookback is no longer a
+# query parameter; it's a post-filter on the returned series.
+LOOKBACK_DAYS = 60               # post-filter; capped by what the API has
+MIN_DAYS_TO_CLOSE = 30           # only consider markets that close >= 30d out
 MAX_EVENTS = 80                  # cap to keep runtime under 5 min
 SLEEP_BETWEEN_REQS = 0.4         # be polite to gamma + clob
 PAGE_SIZE = 200
 MAX_PAGES = 5
 
-# News-y tag slugs Polymarket uses
-CATEGORY_TAGS = ("politics", "elections", "trump", "world", "geopolitics")
+# Narrow to genuinely long-dated news-driven tags. Dropping 'trump',
+# 'world', 'geopolitics' which over-sample short-lived sub-events
+# (single-headline markets that resolve in hours).
+CATEGORY_TAGS = ("politics", "elections")
 
 # Fee model
 FEE_TAKER = 0.02                 # 2% taker assumption (conservative)
@@ -128,16 +132,20 @@ class ValidationResult:
 # ── Polymarket fetch ────────────────────────────────────────────────────────
 
 def fetch_recent_political_markets() -> list[dict]:
-    """Pull resolved markets in news-relevant categories from the past
-    LOOKBACK_DAYS. Returns a flat list of market dicts each containing
-    a `clobTokenIds` field we can use to query price history."""
+    """Pull political markets (both closed AND open) for jump detection
+    on their historical price series. Closed political markets are
+    especially useful — they resolved via news catalysts so contain
+    real reaction events. We sort by recent activity (endDate desc)
+    and accept anything with at least LOOKBACK_DAYS of life on either
+    side of `now`."""
     out: list[dict] = []
-    cutoff = datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)
+    # Allow markets that closed up to LOOKBACK_DAYS ago OR are still open;
+    # both have usable history for the jump-detection backtest.
+    earliest_close_dt = datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)
 
     for tag in CATEGORY_TAGS:
         for page in range(MAX_PAGES):
             params = {
-                "closed":    "true",
                 "limit":     str(PAGE_SIZE),
                 "offset":    str(page * PAGE_SIZE),
                 "tag_slug":  tag,
@@ -161,20 +169,13 @@ def fetch_recent_political_markets() -> list[dict]:
                     end_dt = datetime.fromisoformat(end_raw.replace("Z", "+00:00"))
                 except (TypeError, AttributeError, ValueError):
                     continue
-                if end_dt < cutoff:
+                # Skip ancient markets — they pre-date our LOOKBACK_DAYS
+                if end_dt < earliest_close_dt:
                     continue
                 for m in e.get("markets", []):
                     m.setdefault("_event_title", e.get("title", ""))
                     m.setdefault("_event_end", end_raw)
                     out.append(m)
-
-            # Early break if we've gone past the lookback window
-            last_raw = page_events[-1].get("endDate", "")
-            try:
-                if datetime.fromisoformat(last_raw.replace("Z", "+00:00")) < cutoff:
-                    break
-            except (TypeError, AttributeError, ValueError):
-                pass
 
             time.sleep(SLEEP_BETWEEN_REQS)
 
@@ -198,19 +199,12 @@ def fetch_recent_political_markets() -> list[dict]:
 
 
 def fetch_price_history(token_id: str) -> list[tuple[datetime, float]]:
-    """Pull minute-granularity price history for a CLOB token. Returns
-    list of (timestamp, price) sorted ascending. Empty list on failure."""
-    end_ts = int(datetime.now(timezone.utc).timestamp())
-    start_ts = end_ts - (LOOKBACK_DAYS * 86400)
-    # NOTE: Polymarket CLOB prices-history accepts EITHER `interval=<bucket>`
-    # OR `startTs+endTs+fidelity` — passing both returns an empty history.
-    # `fidelity` is minutes-per-bucket; 60 = 1h buckets.
-    params = {
-        "market":   token_id,
-        "startTs":  str(start_ts),
-        "endTs":    str(end_ts),
-        "fidelity": "60",
-    }
+    """Pull full price history at the indexer's native bucket size.
+    `interval=max` is the only form that reliably returns history for
+    long-lived markets; the explicit startTs/endTs form returns 0 points
+    for narrow windows even when data exists. Caller post-filters to
+    LOOKBACK_DAYS of history."""
+    params = {"market": token_id, "interval": "max"}
     try:
         r = requests.get(CLOB_HISTORY_URL, params=params, timeout=20)
         r.raise_for_status()
@@ -231,6 +225,9 @@ def fetch_price_history(token_id: str) -> list[tuple[datetime, float]]:
         except (ValueError, TypeError, OSError):
             continue
     out.sort(key=lambda x: x[0])
+    # Post-filter to LOOKBACK_DAYS of recent history
+    cutoff = datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)
+    out = [(ts, p) for ts, p in out if ts >= cutoff]
     return out
 
 
